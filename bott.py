@@ -9,7 +9,7 @@ import time
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-BOT_CLIENT_ID = "YOUR_BOT_CLIENT_ID_HERE"  # from Developer Portal, used to build invite links
+BOT_CLIENT_ID = "1546323834561634324"  # from Developer Portal, used to build invite links
 CONFIG_FILE = "configs.json"
 BACKUP_DIR = "backups"
 LOCKDOWN_DIR = "lockdowns"
