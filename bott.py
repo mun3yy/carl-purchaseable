@@ -162,7 +162,7 @@ async def globally_block_blacklisted(ctx):
 # =================================================================
 
 setup_sessions = {}
-pending_switch_context = {}  # user_id -> {"key": str, "time": ts}
+pending_switch_context = {}
 
 def start_session(user_id, stage):
     setup_sessions[user_id] = {"stage": stage, "data": {}, "expires": time.time() + SETUP_TIMEOUT}
@@ -1042,7 +1042,7 @@ async def lockdown(ctx):
     if lockdown_active_map.get(guild.id):
         return await ctx.send("⚠️ Already in lockdown.")
     count = await do_lockdown(guild)
-    await ctx.send(f"🔒 Lockdown engaged. {count} channels restricted (exact prior state saved).")
+    await log_and_dm(ctx.author.id, guild, f"🔒 **Lockdown manually engaged** by owner. {count} channels restricted (exact prior state saved).")
 
 @bot.command()
 @require_setup()
@@ -1052,7 +1052,7 @@ async def unlock(ctx):
     if not lockdown_active_map.get(guild.id) and not os.path.exists(lockdown_path(guild.id)):
         return await ctx.send("Not currently in lockdown.")
     count = await do_unlock(guild)
-    await ctx.send(f"🔓 Lockdown lifted. {count} channels restored to their exact original state.")
+    await log_and_dm(ctx.author.id, guild, f"🔓 **Lockdown manually lifted** by owner. {count} channels restored to their exact original state.")
 
 # =================================================================
 # KILL SWITCH
