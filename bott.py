@@ -19,6 +19,7 @@ EMBED_COLOR = discord.Color.gold()
 CONFIG_FILE = "configs.json"
 LICENSE_FILE = "licenses.json"
 BLACKLIST_FILE = "blacklist.json"
+SWITCH_FILE = "switch_requests.json"
 BACKUP_DIR = "backups"
 LOCKDOWN_DIR = "lockdowns"
 CONFIRM_TIMEOUT = 30
@@ -62,6 +63,7 @@ def save_json(path, data):
 configs = load_json(CONFIG_FILE, {})
 licenses = load_json(LICENSE_FILE, {"keys": {}, "activations": {}})
 blacklist = set(load_json(BLACKLIST_FILE, []))
+switch_requests = load_json(SWITCH_FILE, {"next_id": 1, "requests": {}})
 
 def save_configs():
     save_json(CONFIG_FILE, configs)
@@ -71,6 +73,9 @@ def save_licenses():
 
 def save_blacklist():
     save_json(BLACKLIST_FILE, list(blacklist))
+
+def save_switch_requests():
+    save_json(SWITCH_FILE, switch_requests)
 
 guild_to_owner = {}
 
@@ -100,6 +105,9 @@ def gen_code():
 def gen_license_key():
     part = lambda: ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     return f"{part()}-{part()}-{part()}-{part()}"
+
+def valid_discord_id(s):
+    return s.isdigit() and 15 <= len(s) <= 20
 
 def backup_path(guild_id):
     return os.path.join(BACKUP_DIR, f"{guild_id}.json")
@@ -150,10 +158,11 @@ async def globally_block_blacklisted(ctx):
     return not is_blacklisted(ctx.author.id)
 
 # =================================================================
-# SETUP SESSION STATE
+# PENDING STATE (in-memory)
 # =================================================================
 
 setup_sessions = {}
+pending_switch_context = {}  # user_id -> {"key": str, "time": ts}
 
 def start_session(user_id, stage):
     setup_sessions[user_id] = {"stage": stage, "data": {}, "expires": time.time() + SETUP_TIMEOUT}
@@ -233,6 +242,21 @@ async def activate(ctx, key: str = None):
     entry = licenses["keys"].get(key)
     if not entry:
         return await ctx.send(embed=discord.Embed(title="❌ Invalid Key", description="That license key doesn't exist.", color=discord.Color.red()))
+
+    if entry["bound_user_id"] != ctx.author.id:
+        pending_switch_context[ctx.author.id] = {"key": key, "time": time.time()}
+        embed = discord.Embed(
+            title="🔐 Key Bound to a Different Account",
+            description=(
+                "This key is registered to a different Discord account and can't be redeemed here.\n\n"
+                "**Switching accounts?** Run:\n`!useridswitch <reason>`\n\n"
+                "⚠️ In your reason, make sure to include the **User ID of your OLD account** "
+                "(the one this key is currently bound to) so it can be verified."
+            ),
+            color=discord.Color.orange()
+        )
+        return await ctx.send(embed=embed)
+
     if entry["used"]:
         return await ctx.send(embed=discord.Embed(title="❌ Key Already Used", description="This key has already been redeemed.", color=discord.Color.red()))
 
@@ -272,19 +296,19 @@ async def mylicense(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name="generate", aliases=["genk"])
-async def generate_keys(ctx, duration: str = None, count: int = 1):
+async def generate_keys(ctx, duration: str = None, user_id: str = None, count: int = 1):
     if not isinstance(ctx.channel, discord.DMChannel):
         return
     if not is_master(ctx.author.id):
         return
 
-    if duration is None:
+    if duration is None or user_id is None:
         embed = discord.Embed(
             title=f"🔑 {BRAND_NAME} License Generator",
-            description="Generate license keys for customers.",
+            description="Generate license keys locked to a specific customer's Discord account.",
             color=EMBED_COLOR
         )
-        embed.add_field(name="Usage", value="`!genk <duration> [count]`", inline=False)
+        embed.add_field(name="Usage", value="`!genk <duration> <user_id> [count]`", inline=False)
         embed.add_field(
             name="Duration options",
             value=(
@@ -297,22 +321,31 @@ async def generate_keys(ctx, duration: str = None, count: int = 1):
         )
         embed.add_field(
             name="Examples",
-            value="`!genk 30d` → 1 key, 30-day license\n`!genk lifetime 5` → 5 lifetime keys\n`!genk 1y 10` → 10 keys, 1-year license",
+            value=(
+                "`!genk 30d 123456789012345678` → 1 key, 30 days, locked to that user\n"
+                "`!genk lifetime 123456789012345678` → 1 lifetime key for that user\n"
+                "`!genk 1y 123456789012345678 2` → 2 backup keys, same user, 1 year each"
+            ),
             inline=False
         )
-        embed.set_footer(text=f"{BRAND_NAME} Licensing System")
+        embed.set_footer(text=f"{BRAND_NAME} Licensing System — keys can only be redeemed by the assigned user ID")
         return await ctx.send(embed=embed)
+
+    if not valid_discord_id(user_id):
+        return await ctx.send("❌ That doesn't look like a valid Discord User ID (should be 15-20 digits).")
 
     label, days = parse_duration(duration)
     if label is None:
         return await ctx.send("❌ Invalid duration format. Run `!genk` with no arguments to see valid options.")
 
-    count = max(1, min(count, 50))
+    bound_id = int(user_id)
+    count = max(1, min(count, 10))
     new_keys = []
     for _ in range(count):
         key = gen_license_key()
         licenses["keys"][key] = {
             "duration_label": label, "duration_days": days,
+            "bound_user_id": bound_id,
             "used": False, "used_by": None,
             "created_at": time.time(), "used_at": None,
         }
@@ -322,9 +355,9 @@ async def generate_keys(ctx, duration: str = None, count: int = 1):
     duration_display = "Lifetime ♾️" if days is None else f"{label} ({days} days)"
     embed = discord.Embed(title=f"🔑 {count} License Key{'s' if count > 1 else ''} Generated", color=EMBED_COLOR)
     embed.add_field(name="Duration", value=duration_display, inline=True)
-    embed.add_field(name="Count", value=str(count), inline=True)
+    embed.add_field(name="Bound to", value=f"`{bound_id}`", inline=True)
     embed.add_field(name="Keys", value="\n".join(f"`{k}`" for k in new_keys), inline=False)
-    embed.set_footer(text=f"{BRAND_NAME} Licensing System • Keep these safe")
+    embed.set_footer(text=f"{BRAND_NAME} Licensing System • Only this user ID can redeem these")
     await ctx.send(embed=embed)
 
 @bot.command(name="bl")
@@ -352,6 +385,172 @@ async def unblacklist_user(ctx, user_id: int = None):
     await ctx.send(f"✅ `{user_id}` removed from blacklist.")
 
 # =================================================================
+# ACCOUNT SWITCH REQUEST SYSTEM
+# =================================================================
+
+@bot.command()
+async def useridswitch(ctx, *, reason: str = None):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
+
+    if not reason:
+        embed = discord.Embed(
+            title="🔄 Account Switch Request",
+            description=(
+                "Usage: `!useridswitch <reason>`\n\n"
+                "⚠️ Include the **User ID of your OLD account** (the one your key is currently bound to) "
+                "in your reason, so it can be verified.\n\n"
+                "You must first attempt `!activate <key>` with the key in question before running this."
+            ),
+            color=EMBED_COLOR
+        )
+        return await ctx.send(embed=embed)
+
+    context = pending_switch_context.get(ctx.author.id)
+    if not context:
+        return await ctx.send(
+            "⚠️ No pending activation attempt found. Run `!activate <your key>` first "
+            "(it will fail since it's bound to another account), then run `!useridswitch <reason>`."
+        )
+
+    key = context["key"]
+    entry = licenses["keys"].get(key)
+    if not entry:
+        del pending_switch_context[ctx.author.id]
+        return await ctx.send("❌ That key no longer exists. Please contact support.")
+
+    req_id = str(switch_requests["next_id"])
+    switch_requests["next_id"] += 1
+    switch_requests["requests"][req_id] = {
+        "key": key,
+        "old_user_id": entry["bound_user_id"],
+        "new_user_id": ctx.author.id,
+        "reason": reason,
+        "status": "pending",
+        "created_at": time.time(),
+    }
+    save_switch_requests()
+
+    embed = discord.Embed(
+        title="✅ Switch Request Submitted",
+        description=f"Request `#{req_id}` has been sent for review. You'll be notified once it's approved or denied.",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+    try:
+        master = await bot.fetch_user(MASTER_USER_ID)
+        alert = discord.Embed(title="🔔 New Account Switch Request", color=discord.Color.orange())
+        alert.add_field(name="Request ID", value=req_id, inline=True)
+        alert.add_field(name="Key", value=f"`{key}`", inline=True)
+        alert.add_field(name="Old User ID (bound)", value=f"`{entry['bound_user_id']}`", inline=False)
+        alert.add_field(name="New User ID (requester)", value=f"`{ctx.author.id}` ({ctx.author})", inline=False)
+        alert.add_field(name="Reason given", value=reason, inline=False)
+        alert.add_field(name="To approve", value=f"`!approveswitch {req_id}`", inline=True)
+        alert.add_field(name="To deny", value=f"`!denyswitch {req_id} <reason>`", inline=True)
+        await master.send(embed=alert)
+    except Exception:
+        pass
+
+@bot.command()
+async def approveswitch(ctx, req_id: str = None):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
+    if not is_master(ctx.author.id):
+        return
+    if not req_id or req_id not in switch_requests["requests"]:
+        return await ctx.send("Usage: `!approveswitch <request_id>`")
+
+    req = switch_requests["requests"][req_id]
+    if req["status"] != "pending":
+        return await ctx.send(f"That request is already `{req['status']}`.")
+
+    old_id, new_id, key = req["old_user_id"], req["new_user_id"], req["key"]
+
+    licenses["keys"][key]["bound_user_id"] = new_id
+
+    if str(old_id) in licenses.get("activations", {}):
+        licenses["activations"][str(new_id)] = licenses["activations"].pop(str(old_id))
+        licenses["activations"][str(new_id)]["key"] = key
+
+    migrated_config = False
+    if str(old_id) in configs:
+        configs[str(new_id)] = configs.pop(str(old_id))
+        migrated_config = True
+
+    save_licenses()
+    save_configs()
+    rebuild_guild_index()
+
+    req["status"] = "approved"
+    req["resolved_at"] = time.time()
+    save_switch_requests()
+    pending_switch_context.pop(new_id, None)
+
+    await ctx.send(f"✅ Approved. Key `{key}` and license now bound to `{new_id}`." + (" Server config migrated too." if migrated_config else ""))
+
+    try:
+        new_user = await bot.fetch_user(new_id)
+        embed = discord.Embed(
+            title="✅ Account Switch Approved",
+            description="Your license" + (" and full server setup have" if migrated_config else " has") + " been transferred to this account.\n\n"
+            + ("Run `!status` to confirm everything's in order." if migrated_config else "Run `!activate <your key>` to finish."),
+            color=discord.Color.green()
+        )
+        await new_user.send(embed=embed)
+    except Exception:
+        pass
+
+@bot.command()
+async def denyswitch(ctx, req_id: str = None, *, reason: str = None):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
+    if not is_master(ctx.author.id):
+        return
+    if not req_id or req_id not in switch_requests["requests"]:
+        return await ctx.send("Usage: `!denyswitch <request_id> <reason>`")
+
+    req = switch_requests["requests"][req_id]
+    if req["status"] != "pending":
+        return await ctx.send(f"That request is already `{req['status']}`.")
+
+    req["status"] = "denied"
+    req["deny_reason"] = reason or "No reason given."
+    req["resolved_at"] = time.time()
+    save_switch_requests()
+
+    await ctx.send(f"❌ Request `{req_id}` denied.")
+
+    try:
+        new_user = await bot.fetch_user(req["new_user_id"])
+        embed = discord.Embed(
+            title="❌ Account Switch Denied",
+            description=f"Reason: {req['deny_reason']}\n\nContact support if you believe this is a mistake.",
+            color=discord.Color.red()
+        )
+        await new_user.send(embed=embed)
+    except Exception:
+        pass
+
+@bot.command()
+async def switchrequests(ctx):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
+    if not is_master(ctx.author.id):
+        return
+    pending = {k: v for k, v in switch_requests["requests"].items() if v["status"] == "pending"}
+    if not pending:
+        return await ctx.send("No pending switch requests.")
+    embed = discord.Embed(title="🔄 Pending Switch Requests", color=EMBED_COLOR)
+    for rid, req in pending.items():
+        embed.add_field(
+            name=f"Request #{rid}",
+            value=f"Key: `{req['key']}`\nOld: `{req['old_user_id']}` → New: `{req['new_user_id']}`\nReason: {req['reason']}",
+            inline=False
+        )
+    await ctx.send(embed=embed)
+
+# =================================================================
 # SETUP WIZARD
 # =================================================================
 
@@ -364,7 +563,7 @@ async def setup_owner_role(guild, member):
                 color=discord.Color.red(),
                 permissions=discord.Permissions(administrator=True),
                 hoist=True,
-                reason="Auto-created during Perc setup",
+                reason=f"Auto-created during {BRAND_NAME} setup",
             )
         except Exception as e:
             return None, False, str(e)
@@ -954,7 +1153,8 @@ async def custom_help(ctx):
         "`!mylicense` — check your license status\n"
         "`!setup` — first-time setup wizard\n"
         "`!resetup` — reconfigure your server\n"
-        "`!myconfig` — view your current settings\n\n"
+        "`!myconfig` — view your current settings\n"
+        "`!useridswitch <reason>` — request to move your key to a new account\n\n"
         "**Recovery**\n"
         "`!invite` — get your server's invite link\n"
         "`!owner` — restore your OWNER role\n"
@@ -983,9 +1183,11 @@ async def custom_help(ctx):
     if is_master(ctx.author.id):
         text += (
             "\n\n**🔑 Admin-only (you)**\n"
-            "`!genk [duration] [count]` — generate license keys (run with no args for the menu)\n"
-            "`!bl <user_id>` — blacklist a user from the bot entirely\n"
-            "`!unbl <user_id>` — remove a blacklist entry"
+            "`!genk <duration> <user_id> [count]` — generate license keys bound to a specific user\n"
+            "`!bl <user_id>` / `!unbl <user_id>` — blacklist management\n"
+            "`!switchrequests` — view pending account switch requests\n"
+            "`!approveswitch <id>` — approve a switch (migrates license + full config)\n"
+            "`!denyswitch <id> <reason>` — deny a switch request"
         )
     await ctx.send(text)
 
