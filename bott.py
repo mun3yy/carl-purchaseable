@@ -8,6 +8,7 @@ import asyncio
 import json
 import time
 import re
+import hashlib
 import asyncpg
 import httpx
 from datetime import datetime, timezone
@@ -72,7 +73,13 @@ pool = None
 class PercBot(commands.Bot):
     async def setup_hook(self):
         global pool
-        pool = await asyncpg.create_pool(DATABASE_URL)
+        # statement_cache_size=0 disables asyncpg's per-connection prepared
+        # statement caching. Without this, running schema changes (ALTER TABLE)
+        # in init_db() and then immediately querying those same tables can
+        # trigger "InvalidCachedStatementError: cached statement plan is invalid
+        # due to a database schema or configuration change" — this setting
+        # avoids that failure mode entirely.
+        pool = await asyncpg.create_pool(DATABASE_URL, statement_cache_size=0)
         await init_db()
         await load_all_from_db()
         self.add_view(ShopPanelView())
@@ -477,6 +484,89 @@ async def log_embed(owner_id, guild, title, description, color=EMBED_COLOR, fiel
         await user.send(embed=embed)
     except Exception:
         pass
+
+# =================================================================
+# LTC ADDRESS VALIDATION
+# =================================================================
+# Real checksum validation, not just a prefix/length regex. This decodes the
+# address and verifies the actual checksum embedded in it, so it will catch
+# almost any typo — a garbled character, a dropped digit, wrong network, etc.
+# Covers both legacy Base58Check addresses (L.../M.../3...) and native
+# SegWit Bech32 addresses (ltc1...).
+
+_LTC_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def _base58_decode(s):
+    num = 0
+    for char in s:
+        idx = _LTC_BASE58_ALPHABET.find(char)
+        if idx == -1:
+            return None
+        num = num * 58 + idx
+    body = num.to_bytes((num.bit_length() + 7) // 8, byteorder="big") if num > 0 else b""
+    n_leading_zeros = len(s) - len(s.lstrip("1"))
+    return b"\x00" * n_leading_zeros + body
+
+
+def _is_valid_base58check_ltc(address):
+    if not (25 <= len(address) <= 35):
+        return False
+    decoded = _base58_decode(address)
+    if decoded is None or len(decoded) < 5:
+        return False
+    payload, checksum = decoded[:-4], decoded[-4:]
+    computed = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    if computed != checksum:
+        return False
+    # Litecoin mainnet version bytes: 0x30 -> 'L' (P2PKH), 0x32 -> 'M' (P2SH),
+    # 0x05 -> legacy '3' P2SH (shared historically with Bitcoin's format).
+    return payload[0] in (0x30, 0x32, 0x05)
+
+
+def _bech32_polymod(values):
+    GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for v in values:
+        b = chk >> 25
+        chk = (chk & 0x1ffffff) << 5 ^ v
+        for i in range(5):
+            chk ^= GEN[i] if ((b >> i) & 1) else 0
+    return chk
+
+
+def _bech32_hrp_expand(hrp):
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+
+def _is_valid_bech32_ltc(address):
+    address = address.lower()
+    if not address.startswith("ltc1"):
+        return False
+    pos = address.rfind("1")
+    if pos < 1 or pos + 7 > len(address) or len(address) > 90:
+        return False
+    hrp = address[:pos]
+    if hrp != "ltc":
+        return False
+    data_part = address[pos + 1:]
+    try:
+        data = [_BECH32_CHARSET.index(c) for c in data_part]
+    except ValueError:
+        return False
+    return _bech32_polymod(_bech32_hrp_expand(hrp) + data) == 1
+
+
+def is_valid_ltc_address(address):
+    address = (address or "").strip()
+    if not address:
+        return False
+    if address.lower().startswith("ltc1"):
+        return _is_valid_bech32_ltc(address)
+    if address[0] in ("L", "M", "3"):
+        return _is_valid_base58check_ltc(address)
+    return False
 
 # =================================================================
 # SMALL HELPERS
@@ -1012,15 +1102,30 @@ async def setltc(interaction: discord.Interaction, address: str):
     if not is_master(interaction.user.id):
         return await interaction.response.send_message("Not authorized.", ephemeral=True)
 
-    shop_settings["ltc_address"] = address.strip()
+    address = address.strip()
+    if not is_valid_ltc_address(address):
+        return await interaction.response.send_message(
+            embed=brand_embed(
+                "❌ Invalid LTC Address",
+                "That doesn't pass checksum validation as a real Litecoin address.\n\n"
+                "Valid formats:\n"
+                "• Legacy: starts with `L`\n"
+                "• P2SH: starts with `M` (or legacy `3`)\n"
+                "• SegWit: starts with `ltc1`\n\n"
+                "Double check for typos and try again.",
+                discord.Color.red()
+            ), ephemeral=True
+        )
+
+    shop_settings["ltc_address"] = address
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO shop_settings (id, ltc_address) VALUES (1, $1)
             ON CONFLICT (id) DO UPDATE SET ltc_address=$1
-        """, address.strip())
+        """, address)
 
     await interaction.response.send_message(
-        embed=brand_embed("✅ Fallback LTC Address Set", f"`{address.strip()}`\n\nSellers who haven't run `!setmyltc` will route payments here.", discord.Color.green()),
+        embed=brand_embed("✅ Fallback LTC Address Set", f"`{address}`\n\nSellers who haven't run `!setmyltc` will route payments here.", discord.Color.green()),
         ephemeral=True
     )
 
@@ -1944,10 +2049,24 @@ async def setmyltc(ctx, address: str = None):
             "Usage", "`!setmyltc <your LTC address>`\n\nLTC payments made through your `/shop` panel will be sent directly here instead of the platform default.",
             discord.Color.orange()
         ))
+
+    address = address.strip()
+    if not is_valid_ltc_address(address):
+        return await ctx.send(embed=brand_embed(
+            "❌ Invalid LTC Address",
+            "That doesn't pass checksum validation as a real Litecoin address — likely a typo.\n\n"
+            "Valid formats:\n"
+            "• Legacy: starts with `L`\n"
+            "• P2SH: starts with `M` (or legacy `3`)\n"
+            "• SegWit: starts with `ltc1`\n\n"
+            "**Double-check this carefully — an incorrect address means real customer payments go somewhere unrecoverable.**",
+            discord.Color.red()
+        ))
+
     cfg = get_config(ctx.author.id)
-    cfg["ltc_address"] = address.strip()
+    cfg["ltc_address"] = address
     await db_upsert_config(ctx.author.id, cfg)
-    await ctx.send(embed=brand_embed("✅ Your LTC Address Set", f"`{address.strip()}`\n\nAll LTC payments from your shop now go here.", discord.Color.green()))
+    await ctx.send(embed=brand_embed("✅ Your LTC Address Set", f"`{address}`\n\nAll LTC payments from your shop now go here.", discord.Color.green()))
 
 
 @bot.command(name="mysales")
