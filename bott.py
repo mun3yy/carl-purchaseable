@@ -13,7 +13,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 BOT_CLIENT_ID = "1546323834561634324"
 MASTER_USER_ID = 1414107360099831808  # <-- YOUR user ID only
 
-BRAND_NAME = "Sentinel"
+BRAND_NAME = "Perc"
 EMBED_COLOR = discord.Color.gold()
 
 CONFIG_FILE = "configs.json"
@@ -181,12 +181,23 @@ async def get_audit_actor(guild, action, target_id=None):
     return None
 
 async def log_and_dm(owner_id, guild, message):
-    channel = guild.system_channel
+    cfg = configs.get(str(owner_id), {})
+    log_channel_id = cfg.get("log_channel_id")
+    channel = guild.get_channel(log_channel_id) if log_channel_id else None
+
     if channel:
         try:
             await channel.send(message)
         except Exception:
             pass
+    else:
+        fallback = guild.system_channel
+        if fallback:
+            try:
+                await fallback.send(message)
+            except Exception:
+                pass
+
     try:
         user = await bot.fetch_user(owner_id)
         await user.send(message)
@@ -353,7 +364,7 @@ async def setup_owner_role(guild, member):
                 color=discord.Color.red(),
                 permissions=discord.Permissions(administrator=True),
                 hoist=True,
-                reason="Auto-created during bot setup",
+                reason="Auto-created during Perc setup",
             )
         except Exception as e:
             return None, False, str(e)
@@ -362,6 +373,24 @@ async def setup_owner_role(guild, member):
         return role, True, None
     except Exception as e:
         return role, False, str(e)
+
+async def create_log_channel(guild, owner_member):
+    everyone = guild.default_role
+    overwrites = {
+        everyone: discord.PermissionOverwrite(view_channel=False),
+        owner_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
+    }
+    try:
+        channel = await guild.create_text_channel(
+            "perc-logs",
+            overwrites=overwrites,
+            reason=f"{BRAND_NAME}: auto-created security log channel",
+            topic=f"🛡️ {BRAND_NAME} security logs — raid detection, lockdowns, and recovery events."
+        )
+        return channel, None
+    except Exception as e:
+        return None, str(e)
 
 @bot.command()
 async def setup(ctx):
@@ -375,7 +404,7 @@ async def setup(ctx):
 
     start_session(ctx.author.id, "await_user_id")
     await ctx.send(
-        "👋 **Welcome to setup!**\n\n"
+        f"👋 **Welcome to {BRAND_NAME} setup!**\n\n"
         "**Step 1/3 — Confirm your User ID**\n"
         "Enable Developer Mode: `User Settings → Advanced → Developer Mode` (toggle ON)\n"
         "Then right-click your own name/avatar and click **Copy User ID**.\n\n"
@@ -402,10 +431,12 @@ async def myconfig(ctx):
     if not cfg or not cfg.get("setup_complete"):
         return await ctx.send("No config found. Use `!setup` to create one.")
     guild = bot.get_guild(cfg["guild_id"])
+    log_ch = guild.get_channel(cfg.get("log_channel_id")) if guild and cfg.get("log_channel_id") else None
     await ctx.send(
         f"**Your configuration:**\n"
         f"Server: {guild.name if guild else 'Unknown'} (`{cfg['guild_id']}`)\n"
         f"Owner role: {cfg['owner_role_name']}\n"
+        f"Log channel: {log_ch.mention if log_ch else 'Not set — run !fixlogs'}\n"
         f"Invite link: {cfg['invite_link']}\n"
         f"Trusted users: {len(cfg.get('trusted', []))}"
     )
@@ -479,12 +510,14 @@ async def handle_setup_message(message):
         guild = bot.get_guild(data["guild_id"])
         member = guild.get_member(user_id)
         role, assigned, err = await setup_owner_role(guild, member)
+        log_channel, log_err = await create_log_channel(guild, member)
 
         configs[str(user_id)] = {
             "guild_id": data["guild_id"],
             "owner_role_name": "OWNER",
             "invite_link": content,
             "trusted": [],
+            "log_channel_id": log_channel.id if log_channel else None,
             "setup_complete": True,
         }
         save_configs()
@@ -502,6 +535,11 @@ async def handle_setup_message(message):
             )
         else:
             msg += f"❌ Couldn't create the OWNER role ({err}). Fix my permissions and run `!resetup`.\n\n"
+
+        if log_channel:
+            msg += f"✅ Created a private log channel: {log_channel.mention} — only you can see it. All raid/security events post there.\n\n"
+        else:
+            msg += f"⚠️ Couldn't create the log channel ({log_err}). I'll DM you security alerts instead. Run `!fixlogs` once my permissions are corrected.\n\n"
 
         msg += (
             "**Always do this:** keep my bot's role at the **top** of Server Settings → Roles. "
@@ -594,6 +632,25 @@ async def untrust(ctx, member_id: int):
         cfg["trusted"].remove(member_id)
         save_configs()
     await ctx.send(f"✅ `{member_id}` removed from trusted list.")
+
+@bot.command()
+@require_setup()
+async def fixlogs(ctx):
+    cfg = get_config(ctx.author.id)
+    guild = bot.get_guild(cfg["guild_id"])
+    member = guild.get_member(ctx.author.id)
+
+    existing_id = cfg.get("log_channel_id")
+    if existing_id and guild.get_channel(existing_id):
+        return await ctx.send(f"✅ Log channel already exists: {guild.get_channel(existing_id).mention}")
+
+    channel, err = await create_log_channel(guild, member)
+    if channel:
+        cfg["log_channel_id"] = channel.id
+        save_configs()
+        await ctx.send(f"✅ Created log channel: {channel.mention}")
+    else:
+        await ctx.send(f"❌ Failed to create log channel: {err}\nCheck that my role has Manage Channels permission.")
 
 # =================================================================
 # BACKUP / RESTORE
@@ -868,10 +925,15 @@ async def status(ctx):
         if ts:
             backup_age = f"{int((time.time()-ts)//60)}m ago"
     status_info = get_license_status(ctx.author.id)
+
+    log_ch = guild.get_channel(cfg.get("log_channel_id")) if cfg.get("log_channel_id") else None
+    log_status = f"✅ {log_ch.mention}" if log_ch else "❌ Missing — run !fixlogs"
+
     await ctx.send(
-        f"**🩺 Status for {guild.name}**\n"
+        f"**🩺 {BRAND_NAME} Status for {guild.name}**\n"
         f"License expires: {status_info['expires_display'] if status_info else 'Unknown'}\n"
         f"Last backup: {backup_age}\n"
+        f"Log channel: {log_status}\n"
         f"Lockdown active: {'Yes 🔒' if lockdown_active_map.get(guild.id) else 'No'}\n"
         f"Top role: {guild.me.top_role.name}\n"
         f"Ban Members: {'✅' if perms.ban_members else '❌'}\n"
@@ -908,12 +970,15 @@ async def custom_help(ctx):
         "`!unlock` — restores each channel to its exact pre-lockdown state\n\n"
         "**Trust Management**\n"
         "`!trust <user_id>` / `!untrust <user_id>`\n\n"
+        "**Logs**\n"
+        "`!fixlogs` — recreate the private security log channel if missing\n\n"
         "**Status**\n"
         "`!status` — bot health, license, backup age, lockdown state, permissions\n\n"
         "**Automatic Protection (no command needed)**\n"
         "• Auto-unban if you get banned\n"
         "• Anti-nuke: detects mass bans/kicks/channel/role deletions, neutralizes the actor, auto-restores victims\n"
-        "• Mass-join raid detection: auto-locks the server if too many accounts join too fast"
+        "• Mass-join raid detection: auto-locks the server if too many accounts join too fast\n"
+        "• All security events logged to your private #perc-logs channel"
     )
     if is_master(ctx.author.id):
         text += (
