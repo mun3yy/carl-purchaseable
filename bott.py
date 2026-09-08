@@ -7,25 +7,21 @@ import asyncio
 import json
 import time
 import re
+import asyncpg
 from datetime import datetime, timezone
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 BOT_CLIENT_ID = "1546323834561634324"
 MASTER_USER_ID = 1414107360099831808
 
 BRAND_NAME = "Perc"
 EMBED_COLOR = discord.Color.gold()
 
-DATA_DIR = os.environ.get("DATA_DIR", ".")  # point this at a mounted persistent volume!
-os.makedirs(DATA_DIR, exist_ok=True)
-
-CONFIG_FILE = os.path.join(DATA_DIR, "configs.json")
-LICENSE_FILE = os.path.join(DATA_DIR, "licenses.json")
-BLACKLIST_FILE = os.path.join(DATA_DIR, "blacklist.json")
-SWITCH_FILE = os.path.join(DATA_DIR, "switch_requests.json")
-BACKUP_DIR = os.path.join(DATA_DIR, "backups")
-LOCKDOWN_DIR = os.path.join(DATA_DIR, "lockdowns")
 CONFIRM_TIMEOUT = 30
 SETUP_TIMEOUT = 300
 
@@ -38,17 +34,260 @@ RAID_ROLE_DELETE_THRESHOLD = 2
 JOIN_RAID_WINDOW = 30
 JOIN_RAID_THRESHOLD = 10
 MASS_JOIN_COOLDOWN = 300
-# ============================================
 
-os.makedirs(BACKUP_DIR, exist_ok=True)
-os.makedirs(LOCKDOWN_DIR, exist_ok=True)
+PRICE_MAP = {
+    "30d": 7.99,
+    "lifetime": 19.99,
+}
+# ============================================
 
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 intents.bans = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+# =================================================================
+# IN-MEMORY CACHES (backed by Postgres — loaded on startup)
+# =================================================================
+
+configs = {}
+licenses = {"keys": {}, "activations": {}}
+blacklist = set()
+switch_requests = {"requests": {}}
+guild_to_owner = {}
+lockdown_active_map = {}
+pool = None
+
+
+class PercBot(commands.Bot):
+    async def setup_hook(self):
+        global pool
+        pool = await asyncpg.create_pool(DATABASE_URL)
+        await init_db()
+        await load_all_from_db()
+        if not check_expirations.is_running():
+            check_expirations.start()
+
+
+bot = PercBot(command_prefix="!", intents=intents, help_command=None)
+
+# =================================================================
+# DATABASE LAYER
+# =================================================================
+
+async def init_db():
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS configs (
+                owner_id BIGINT PRIMARY KEY,
+                guild_id BIGINT,
+                owner_role_name TEXT,
+                invite_link TEXT,
+                trusted BIGINT[],
+                log_channel_id BIGINT,
+                log_category_id BIGINT,
+                setup_complete BOOLEAN
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS license_keys (
+                key TEXT PRIMARY KEY,
+                duration_label TEXT,
+                duration_days INTEGER,
+                bound_user_id BIGINT,
+                used BOOLEAN,
+                used_by BIGINT,
+                created_at DOUBLE PRECISION,
+                used_at DOUBLE PRECISION
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS activations (
+                user_id BIGINT PRIMARY KEY,
+                key TEXT,
+                expires_at DOUBLE PRECISION,
+                duration_label TEXT,
+                warned_3d BOOLEAN DEFAULT FALSE,
+                warned_expired BOOLEAN DEFAULT FALSE
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS blacklist (
+                user_id BIGINT PRIMARY KEY
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS switch_requests (
+                id SERIAL PRIMARY KEY,
+                key TEXT,
+                old_user_id BIGINT,
+                new_user_id BIGINT,
+                reason TEXT,
+                status TEXT,
+                created_at DOUBLE PRECISION,
+                resolved_at DOUBLE PRECISION,
+                deny_reason TEXT
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS backups (
+                guild_id BIGINT PRIMARY KEY,
+                data TEXT,
+                backed_up_at DOUBLE PRECISION
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS lockdowns (
+                guild_id BIGINT PRIMARY KEY,
+                state TEXT
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sales (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                duration_label TEXT,
+                price NUMERIC(10,2),
+                created_at DOUBLE PRECISION
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS raid_events (
+                id SERIAL PRIMARY KEY,
+                guild_id BIGINT,
+                owner_id BIGINT,
+                actor_id BIGINT,
+                action_desc TEXT,
+                neutralized BOOLEAN,
+                created_at DOUBLE PRECISION
+            );
+        """)
+
+
+async def load_all_from_db():
+    async with pool.acquire() as conn:
+        for r in await conn.fetch("SELECT * FROM configs"):
+            configs[str(r["owner_id"])] = {
+                "guild_id": r["guild_id"],
+                "owner_role_name": r["owner_role_name"],
+                "invite_link": r["invite_link"],
+                "trusted": list(r["trusted"]) if r["trusted"] else [],
+                "log_channel_id": r["log_channel_id"],
+                "log_category_id": r["log_category_id"],
+                "setup_complete": r["setup_complete"],
+            }
+
+        for r in await conn.fetch("SELECT * FROM license_keys"):
+            licenses["keys"][r["key"]] = {
+                "duration_label": r["duration_label"],
+                "duration_days": r["duration_days"],
+                "bound_user_id": r["bound_user_id"],
+                "used": r["used"],
+                "used_by": r["used_by"],
+                "created_at": r["created_at"],
+                "used_at": r["used_at"],
+            }
+
+        for r in await conn.fetch("SELECT * FROM activations"):
+            licenses["activations"][str(r["user_id"])] = {
+                "key": r["key"],
+                "expires_at": r["expires_at"],
+                "duration_label": r["duration_label"],
+                "warned_3d": r["warned_3d"],
+                "warned_expired": r["warned_expired"],
+            }
+
+        for r in await conn.fetch("SELECT user_id FROM blacklist"):
+            blacklist.add(r["user_id"])
+
+        for r in await conn.fetch("SELECT * FROM switch_requests"):
+            switch_requests["requests"][str(r["id"])] = {
+                "key": r["key"], "old_user_id": r["old_user_id"], "new_user_id": r["new_user_id"],
+                "reason": r["reason"], "status": r["status"], "created_at": r["created_at"],
+                "resolved_at": r["resolved_at"], "deny_reason": r["deny_reason"],
+            }
+
+        for r in await conn.fetch("SELECT guild_id FROM lockdowns"):
+            lockdown_active_map[r["guild_id"]] = True
+
+    rebuild_guild_index()
+    print(f"[DB] Loaded {len(configs)} configs, {len(licenses['keys'])} keys, {len(licenses['activations'])} activations.")
+
+
+async def db_upsert_config(owner_id, cfg):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO configs (owner_id, guild_id, owner_role_name, invite_link, trusted, log_channel_id, log_category_id, setup_complete)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            ON CONFLICT (owner_id) DO UPDATE SET
+                guild_id=$2, owner_role_name=$3, invite_link=$4, trusted=$5,
+                log_channel_id=$6, log_category_id=$7, setup_complete=$8
+        """, owner_id, cfg["guild_id"], cfg["owner_role_name"], cfg["invite_link"],
+             cfg.get("trusted", []), cfg.get("log_channel_id"), cfg.get("log_category_id"),
+             cfg.get("setup_complete", False))
+
+
+async def db_delete_config(owner_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM configs WHERE owner_id=$1", owner_id)
+
+
+async def db_upsert_license_key(key, entry):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO license_keys (key, duration_label, duration_days, bound_user_id, used, used_by, created_at, used_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            ON CONFLICT (key) DO UPDATE SET
+                duration_label=$2, duration_days=$3, bound_user_id=$4, used=$5, used_by=$6, created_at=$7, used_at=$8
+        """, key, entry["duration_label"], entry["duration_days"], entry["bound_user_id"],
+             entry["used"], entry.get("used_by"), entry["created_at"], entry.get("used_at"))
+
+
+async def db_upsert_activation(user_id, entry):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO activations (user_id, key, expires_at, duration_label, warned_3d, warned_expired)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            ON CONFLICT (user_id) DO UPDATE SET
+                key=$2, expires_at=$3, duration_label=$4, warned_3d=$5, warned_expired=$6
+        """, user_id, entry["key"], entry.get("expires_at"), entry.get("duration_label"),
+             entry.get("warned_3d", False), entry.get("warned_expired", False))
+
+
+async def db_delete_activation(user_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM activations WHERE user_id=$1", user_id)
+
+
+async def db_add_blacklist(user_id):
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO blacklist (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+
+
+async def db_remove_blacklist(user_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM blacklist WHERE user_id=$1", user_id)
+
+
+async def db_insert_switch_request(key, old_user_id, new_user_id, reason):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO switch_requests (key, old_user_id, new_user_id, reason, status, created_at)
+            VALUES ($1,$2,$3,$4,'pending',$5) RETURNING id
+        """, key, old_user_id, new_user_id, reason, time.time())
+        return row["id"]
+
+
+async def db_approve_switch_request(req_id, resolved_at):
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE switch_requests SET status='approved', resolved_at=$2 WHERE id=$1",
+                            int(req_id), resolved_at)
+
+
+async def db_deny_switch_request(req_id, reason, resolved_at):
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE switch_requests SET status='denied', deny_reason=$2, resolved_at=$3 WHERE id=$1",
+                            int(req_id), reason, resolved_at)
 
 # =================================================================
 # EMBED HELPERS
@@ -63,6 +302,7 @@ def brand_embed(title, description=None, color=EMBED_COLOR):
     )
     embed.set_footer(text=f"{BRAND_NAME} Security System")
     return embed
+
 
 async def log_embed(owner_id, guild, title, description, color=EMBED_COLOR, fields=None):
     cfg = configs.get(str(owner_id), {})
@@ -94,37 +334,8 @@ async def log_embed(owner_id, guild, title, description, color=EMBED_COLOR, fiel
         pass
 
 # =================================================================
-# STORAGE
+# SMALL HELPERS
 # =================================================================
-
-def load_json(path, default):
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return default
-
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-configs = load_json(CONFIG_FILE, {})
-licenses = load_json(LICENSE_FILE, {"keys": {}, "activations": {}})
-blacklist = set(load_json(BLACKLIST_FILE, []))
-switch_requests = load_json(SWITCH_FILE, {"next_id": 1, "requests": {}})
-
-def save_configs():
-    save_json(CONFIG_FILE, configs)
-
-def save_licenses():
-    save_json(LICENSE_FILE, licenses)
-
-def save_blacklist():
-    save_json(BLACKLIST_FILE, list(blacklist))
-
-def save_switch_requests():
-    save_json(SWITCH_FILE, switch_requests)
-
-guild_to_owner = {}
 
 def rebuild_guild_index():
     guild_to_owner.clear()
@@ -132,39 +343,35 @@ def rebuild_guild_index():
         if cfg.get("setup_complete") and cfg.get("guild_id"):
             guild_to_owner[cfg["guild_id"]] = int(owner_id)
 
-rebuild_guild_index()
 
 def get_config(user_id):
     return configs.get(str(user_id))
 
+
 def get_owner_id_for_guild(guild_id):
     return guild_to_owner.get(guild_id)
+
 
 def is_blacklisted(user_id):
     return user_id in blacklist
 
+
 def is_master(user_id):
     return user_id == MASTER_USER_ID
 
+
 def gen_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
 
 def gen_license_key():
     part = lambda: ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     return f"{part()}-{part()}-{part()}-{part()}"
 
+
 def valid_discord_id(s):
     return s.isdigit() and 15 <= len(s) <= 20
 
-def backup_path(guild_id):
-    return os.path.join(BACKUP_DIR, f"{guild_id}.json")
-
-def lockdown_path(guild_id):
-    return os.path.join(LOCKDOWN_DIR, f"{guild_id}.json")
-
-# =================================================================
-# LICENSE HELPERS
-# =================================================================
 
 def parse_duration(token):
     token = token.lower().strip()
@@ -176,6 +383,7 @@ def parse_duration(token):
     num, unit = int(m.group(1)), m.group(2)
     days_per_unit = {"d": 1, "w": 7, "m": 30, "y": 365}
     return f"{num}{unit}", num * days_per_unit[unit]
+
 
 def get_license_status(user_id):
     entry = licenses.get("activations", {}).get(str(user_id))
@@ -189,34 +397,37 @@ def get_license_status(user_id):
     )
     return {"valid": valid, "expires_at": expires_at, "expires_display": expires_display, "key": entry.get("key")}
 
+
 def is_activated(user_id):
     status = get_license_status(user_id)
     return status is not None and status["valid"]
 
+
 def is_protection_active(owner_id):
     return is_activated(owner_id)
 
-# =================================================================
-# GLOBAL BLACKLIST GATE
-# =================================================================
 
 @bot.check
 async def globally_block_blacklisted(ctx):
     return not is_blacklisted(ctx.author.id)
 
 # =================================================================
-# PENDING STATE (in-memory)
+# PENDING STATE (ephemeral, in-memory only — fine to lose on restart)
 # =================================================================
 
 setup_sessions = {}
 pending_switch_context = {}
+pending_kills = {}
+
 
 def start_session(user_id, stage):
     setup_sessions[user_id] = {"stage": stage, "data": {}, "expires": time.time() + SETUP_TIMEOUT}
 
+
 def touch_session(user_id):
     if user_id in setup_sessions:
         setup_sessions[user_id]["expires"] = time.time() + SETUP_TIMEOUT
+
 
 def is_exempt(guild_id, user_id):
     owner_id = get_owner_id_for_guild(guild_id)
@@ -226,6 +437,7 @@ def is_exempt(guild_id, user_id):
         return True
     cfg = configs[str(owner_id)]
     return user_id in cfg.get("trusted", [])
+
 
 async def get_audit_actor(guild, action, target_id=None):
     try:
@@ -268,7 +480,7 @@ async def activate(ctx, key: str = None):
             "🔐 Key Bound to a Different Account",
             "This key is registered to a different Discord account and can't be redeemed here.\n\n"
             "**Switching accounts?** Run:\n`!useridswitch <reason>`\n\n"
-            "⚠️ In your reason, make sure to include the **User ID of your OLD account** "
+            "⚠️ In your reason, include the **User ID of your OLD account** "
             "(the one this key is currently bound to) so it can be verified.",
             discord.Color.orange()
         )
@@ -284,10 +496,12 @@ async def activate(ctx, key: str = None):
     entry["used"] = True
     entry["used_by"] = ctx.author.id
     entry["used_at"] = now
-    licenses.setdefault("activations", {})[str(ctx.author.id)] = {
-        "key": key, "expires_at": expires_at, "duration_label": entry["duration_label"],
-    }
-    save_licenses()
+    activation = {"key": key, "expires_at": expires_at, "duration_label": entry["duration_label"],
+                  "warned_3d": False, "warned_expired": False}
+    licenses.setdefault("activations", {})[str(ctx.author.id)] = activation
+
+    await db_upsert_license_key(key, entry)
+    await db_upsert_activation(ctx.author.id, activation)
 
     expires_display = "Never (Lifetime) ♾️" if expires_at is None else f"<t:{int(expires_at)}:F>"
     embed = brand_embed(f"🎉 Welcome to {BRAND_NAME}", color=discord.Color.green())
@@ -295,6 +509,7 @@ async def activate(ctx, key: str = None):
     embed.add_field(name="Expires", value=expires_display, inline=True)
     embed.add_field(name="Next step", value="Run `!setup` to configure your server for protection.", inline=False)
     await ctx.send(embed=embed)
+
 
 @bot.command()
 async def mylicense(ctx):
@@ -308,6 +523,88 @@ async def mylicense(ctx):
     embed.add_field(name="Expires", value=status["expires_display"], inline=True)
     await ctx.send(embed=embed)
 
+
+@bot.command(name="bought")
+async def bought(ctx, user_id: str = None, duration: str = None, price: float = None):
+    """Generate a key, DM it to the buyer, and log the sale for !stats."""
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
+    if not is_master(ctx.author.id):
+        return
+
+    if not user_id or not duration:
+        embed = brand_embed(f"💰 {BRAND_NAME} Sale Fulfillment", "Generates a key, sends it to the buyer, and logs the sale.", EMBED_COLOR)
+        embed.add_field(name="Usage", value="`!bought <user_id> <duration> [price]`", inline=False)
+        embed.add_field(
+            name="Examples",
+            value=(
+                "`!bought 123456789012345678 30d` → uses default $7.99\n"
+                "`!bought 123456789012345678 lifetime` → uses default $19.99\n"
+                "`!bought 123456789012345678 90d 14.99` → custom price for a plan with no default"
+            ),
+            inline=False
+        )
+        return await ctx.send(embed=embed)
+
+    if not valid_discord_id(user_id):
+        return await ctx.send(embed=brand_embed("❌ Invalid User ID", "Should be 15–20 digits.", discord.Color.red()))
+
+    label, days = parse_duration(duration)
+    if label is None:
+        return await ctx.send(embed=brand_embed("❌ Invalid Duration", "Try `lifetime`, `30d`, `6m`, `1y`, etc.", discord.Color.red()))
+
+    final_price = price if price is not None else PRICE_MAP.get(label)
+    if final_price is None:
+        return await ctx.send(embed=brand_embed(
+            "❌ No Price Set For This Plan",
+            f"There's no default price for `{label}`. Specify one:\n`!bought {user_id} {duration} <price>`",
+            discord.Color.orange()
+        ))
+
+    bound_id = int(user_id)
+
+    try:
+        user = await bot.fetch_user(bound_id)
+    except discord.NotFound:
+        return await ctx.send(embed=brand_embed("❌ No Such User", "That ID doesn't match a real Discord account.", discord.Color.red()))
+    except Exception as e:
+        return await ctx.send(embed=brand_embed("❌ Error", str(e), discord.Color.red()))
+
+    key = gen_license_key()
+    entry = {
+        "duration_label": label, "duration_days": days,
+        "bound_user_id": bound_id,
+        "used": False, "used_by": None,
+        "created_at": time.time(), "used_at": None,
+    }
+    licenses["keys"][key] = entry
+    await db_upsert_license_key(key, entry)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO sales (user_id, duration_label, price, created_at) VALUES ($1,$2,$3,$4)",
+            bound_id, label, final_price, time.time()
+        )
+
+    duration_display = "Lifetime ♾️" if days is None else f"{label} ({days} days)"
+
+    dm_embed = brand_embed(f"🎉 Thanks for picking up {BRAND_NAME}", color=discord.Color.green())
+    dm_embed.add_field(name="Your key", value=f"`{key}`", inline=False)
+    dm_embed.add_field(name="Plan", value=duration_display, inline=True)
+    dm_embed.add_field(name="Next step", value="Reply here with `!activate <key>` to get set up.", inline=False)
+
+    try:
+        await user.send(embed=dm_embed)
+        confirm = brand_embed("✅ Sent", f"Key delivered to `{bound_id}`.\n`{key}` — {duration_display} — **${final_price:.2f}**", discord.Color.green())
+    except discord.Forbidden:
+        confirm = brand_embed(
+            "⚠️ Couldn't DM Them",
+            f"Key was still created and the sale was logged, but their DMs are closed. Send it manually:\n`{key}` — {duration_display}",
+            discord.Color.orange()
+        )
+    await ctx.send(embed=confirm)
+
+
 @bot.command(name="generate", aliases=["genk"])
 async def generate_keys(ctx, duration: str = None, user_id: str = None, count: int = 1):
     if not isinstance(ctx.channel, discord.DMChannel):
@@ -316,25 +613,11 @@ async def generate_keys(ctx, duration: str = None, user_id: str = None, count: i
         return
 
     if duration is None or user_id is None:
-        embed = brand_embed(f"🔑 {BRAND_NAME} License Generator", "Generate license keys locked to a specific customer's Discord account.", EMBED_COLOR)
+        embed = brand_embed(f"🔑 {BRAND_NAME} License Generator", "Generate keys locked to a specific customer's account without sending them.", EMBED_COLOR)
         embed.add_field(name="Usage", value="`!genk <duration> <user_id> [count]`", inline=False)
         embed.add_field(
             name="Duration options",
-            value=(
-                "`7d` — 7 days\n`30d` — 30 days\n`90d` — 90 days\n"
-                "`1m` — 1 month\n`6m` — 6 months\n`1y` — 1 year\n"
-                "`lifetime` — never expires\n"
-                "*(any `<number>d/w/m/y` works, e.g. `45d`, `2y`)*"
-            ),
-            inline=False
-        )
-        embed.add_field(
-            name="Examples",
-            value=(
-                "`!genk 30d 123456789012345678` → 1 key, 30 days, locked to that user\n"
-                "`!genk lifetime 123456789012345678` → 1 lifetime key for that user\n"
-                "`!genk 1y 123456789012345678 2` → 2 backup keys, same user, 1 year each"
-            ),
+            value="`7d`, `30d`, `90d`, `1m`, `6m`, `1y`, `lifetime` — any `<number>d/w/m/y` works.",
             inline=False
         )
         return await ctx.send(embed=embed)
@@ -351,14 +634,15 @@ async def generate_keys(ctx, duration: str = None, user_id: str = None, count: i
     new_keys = []
     for _ in range(count):
         key = gen_license_key()
-        licenses["keys"][key] = {
+        entry = {
             "duration_label": label, "duration_days": days,
             "bound_user_id": bound_id,
             "used": False, "used_by": None,
             "created_at": time.time(), "used_at": None,
         }
+        licenses["keys"][key] = entry
+        await db_upsert_license_key(key, entry)
         new_keys.append(key)
-    save_licenses()
 
     duration_display = "Lifetime ♾️" if days is None else f"{label} ({days} days)"
     embed = brand_embed(f"🔑 {count} License Key{'s' if count > 1 else ''} Generated", color=discord.Color.green())
@@ -366,6 +650,7 @@ async def generate_keys(ctx, duration: str = None, user_id: str = None, count: i
     embed.add_field(name="Bound to", value=f"`{bound_id}`", inline=True)
     embed.add_field(name="Keys", value="\n".join(f"`{k}`" for k in new_keys), inline=False)
     await ctx.send(embed=embed)
+
 
 @bot.command(name="bl")
 async def blacklist_user(ctx, user_id: int = None):
@@ -376,8 +661,9 @@ async def blacklist_user(ctx, user_id: int = None):
     if not user_id:
         return await ctx.send(embed=brand_embed("Usage", "`!bl <user_id>`", discord.Color.orange()))
     blacklist.add(user_id)
-    save_blacklist()
+    await db_add_blacklist(user_id)
     await ctx.send(embed=brand_embed("🚫 User Blacklisted", f"`{user_id}` can no longer use {BRAND_NAME}.", discord.Color.red()))
+
 
 @bot.command(name="unbl")
 async def unblacklist_user(ctx, user_id: int = None):
@@ -388,11 +674,46 @@ async def unblacklist_user(ctx, user_id: int = None):
     if not user_id:
         return await ctx.send(embed=brand_embed("Usage", "`!unbl <user_id>`", discord.Color.orange()))
     blacklist.discard(user_id)
-    save_blacklist()
+    await db_remove_blacklist(user_id)
     await ctx.send(embed=brand_embed("✅ User Unblacklisted", f"`{user_id}` has regained access.", discord.Color.green()))
 
+
+@bot.command()
+async def stats(ctx):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
+    if not is_master(ctx.author.id):
+        return
+
+    async with pool.acquire() as conn:
+        revenue_row = await conn.fetchrow("SELECT COALESCE(SUM(price),0) AS total, COUNT(*) AS count FROM sales")
+        by_plan = await conn.fetch("""
+            SELECT duration_label, COUNT(*) AS count, COALESCE(SUM(price),0) AS total
+            FROM sales GROUP BY duration_label ORDER BY total DESC
+        """)
+        total_raids = await conn.fetchval("SELECT COUNT(*) FROM raid_events")
+        neutralized_raids = await conn.fetchval("SELECT COUNT(*) FROM raid_events WHERE neutralized = true")
+
+    active_licenses = sum(
+        1 for e in licenses["activations"].values()
+        if e.get("expires_at") is None or e["expires_at"] > time.time()
+    )
+    protected_servers = sum(1 for c in configs.values() if c.get("setup_complete"))
+
+    embed = brand_embed(f"📊 {BRAND_NAME} — Universal Stats", "Numbers across every customer and server.", EMBED_COLOR)
+    embed.add_field(name="💰 Total Revenue", value=f"${revenue_row['total']:.2f} from {revenue_row['count']} sale(s)", inline=False)
+
+    if by_plan:
+        breakdown = "\n".join(f"**{r['duration_label']}** — {r['count']} sold — ${r['total']:.2f}" for r in by_plan)
+        embed.add_field(name="Sales by Plan", value=breakdown, inline=False)
+
+    embed.add_field(name="🛡️ Raids Stopped", value=f"{neutralized_raids} neutralized / {total_raids} detected", inline=True)
+    embed.add_field(name="🔑 Active Licenses", value=str(active_licenses), inline=True)
+    embed.add_field(name="🌐 Protected Servers", value=str(protected_servers), inline=True)
+    await ctx.send(embed=embed)
+
 # =================================================================
-# ACCOUNT SWITCH REQUEST SYSTEM
+# ACCOUNT SWITCH REQUESTS
 # =================================================================
 
 @bot.command()
@@ -404,8 +725,7 @@ async def useridswitch(ctx, *, reason: str = None):
         embed = brand_embed(
             "🔄 Account Switch Request",
             "Usage: `!useridswitch <reason>`\n\n"
-            "⚠️ Include the **User ID of your OLD account** (the one your key is currently bound to) "
-            "in your reason, so it can be verified.\n\n"
+            "⚠️ Include the **User ID of your OLD account** (the one your key is currently bound to).\n\n"
             "You must first attempt `!activate <key>` with the key in question before running this.",
             EMBED_COLOR
         )
@@ -415,7 +735,7 @@ async def useridswitch(ctx, *, reason: str = None):
     if not context:
         return await ctx.send(embed=brand_embed(
             "⚠️ No Pending Attempt Found",
-            "Run `!activate <your key>` first (it will fail since it's bound to another account), then run `!useridswitch <reason>`.",
+            "Run `!activate <your key>` first, then run `!useridswitch <reason>`.",
             discord.Color.orange()
         ))
 
@@ -425,17 +745,11 @@ async def useridswitch(ctx, *, reason: str = None):
         del pending_switch_context[ctx.author.id]
         return await ctx.send(embed=brand_embed("❌ Key No Longer Exists", "Please contact support.", discord.Color.red()))
 
-    req_id = str(switch_requests["next_id"])
-    switch_requests["next_id"] += 1
-    switch_requests["requests"][req_id] = {
-        "key": key,
-        "old_user_id": entry["bound_user_id"],
-        "new_user_id": ctx.author.id,
-        "reason": reason,
-        "status": "pending",
-        "created_at": time.time(),
+    req_id = await db_insert_switch_request(key, entry["bound_user_id"], ctx.author.id, reason)
+    switch_requests["requests"][str(req_id)] = {
+        "key": key, "old_user_id": entry["bound_user_id"], "new_user_id": ctx.author.id,
+        "reason": reason, "status": "pending", "created_at": time.time(),
     }
-    save_switch_requests()
 
     await ctx.send(embed=brand_embed(
         "✅ Switch Request Submitted",
@@ -446,7 +760,7 @@ async def useridswitch(ctx, *, reason: str = None):
     try:
         master = await bot.fetch_user(MASTER_USER_ID)
         alert = brand_embed("🔔 New Account Switch Request", color=discord.Color.orange())
-        alert.add_field(name="Request ID", value=req_id, inline=True)
+        alert.add_field(name="Request ID", value=str(req_id), inline=True)
         alert.add_field(name="Key", value=f"`{key}`", inline=True)
         alert.add_field(name="Old User ID (bound)", value=f"`{entry['bound_user_id']}`", inline=False)
         alert.add_field(name="New User ID (requester)", value=f"`{ctx.author.id}` ({ctx.author})", inline=False)
@@ -456,6 +770,7 @@ async def useridswitch(ctx, *, reason: str = None):
         await master.send(embed=alert)
     except Exception:
         pass
+
 
 @bot.command()
 async def approveswitch(ctx, req_id: str = None):
@@ -473,23 +788,29 @@ async def approveswitch(ctx, req_id: str = None):
     old_id, new_id, key = req["old_user_id"], req["new_user_id"], req["key"]
 
     licenses["keys"][key]["bound_user_id"] = new_id
+    await db_upsert_license_key(key, licenses["keys"][key])
 
     if str(old_id) in licenses.get("activations", {}):
-        licenses["activations"][str(new_id)] = licenses["activations"].pop(str(old_id))
-        licenses["activations"][str(new_id)]["key"] = key
+        activation = licenses["activations"].pop(str(old_id))
+        activation["key"] = key
+        licenses["activations"][str(new_id)] = activation
+        await db_delete_activation(old_id)
+        await db_upsert_activation(new_id, activation)
 
     migrated_config = False
     if str(old_id) in configs:
-        configs[str(new_id)] = configs.pop(str(old_id))
+        cfg = configs.pop(str(old_id))
+        configs[str(new_id)] = cfg
+        await db_delete_config(old_id)
+        await db_upsert_config(new_id, cfg)
         migrated_config = True
 
-    save_licenses()
-    save_configs()
     rebuild_guild_index()
 
+    now = time.time()
     req["status"] = "approved"
-    req["resolved_at"] = time.time()
-    save_switch_requests()
+    req["resolved_at"] = now
+    await db_approve_switch_request(req_id, now)
     pending_switch_context.pop(new_id, None)
 
     await ctx.send(embed=brand_embed(
@@ -510,6 +831,7 @@ async def approveswitch(ctx, req_id: str = None):
     except Exception:
         pass
 
+
 @bot.command()
 async def denyswitch(ctx, req_id: str = None, *, reason: str = None):
     if not isinstance(ctx.channel, discord.DMChannel):
@@ -523,10 +845,11 @@ async def denyswitch(ctx, req_id: str = None, *, reason: str = None):
     if req["status"] != "pending":
         return await ctx.send(embed=brand_embed("Already Resolved", f"That request is already `{req['status']}`.", discord.Color.orange()))
 
+    now = time.time()
     req["status"] = "denied"
     req["deny_reason"] = reason or "No reason given."
-    req["resolved_at"] = time.time()
-    save_switch_requests()
+    req["resolved_at"] = now
+    await db_deny_switch_request(req_id, req["deny_reason"], now)
 
     await ctx.send(embed=brand_embed("❌ Request Denied", f"Request `{req_id}` denied.", discord.Color.red()))
 
@@ -536,6 +859,7 @@ async def denyswitch(ctx, req_id: str = None, *, reason: str = None):
         await new_user.send(embed=embed)
     except Exception:
         pass
+
 
 @bot.command()
 async def switchrequests(ctx):
@@ -576,20 +900,38 @@ async def setup_owner_role(guild, member):
     except Exception as e:
         return role, False, str(e)
 
+
 async def create_log_channel(guild, owner_member, cfg=None):
-    # Replace any existing log channel with a brand new one
-    old_id = cfg.get("log_channel_id") if cfg else None
-    to_remove = []
-    if old_id:
-        ch = guild.get_channel(old_id)
+    """Wipes any existing log channel + category and creates a fresh pair, pinned to the bottom."""
+    old_channel_id = cfg.get("log_channel_id") if cfg else None
+    old_category_id = cfg.get("log_category_id") if cfg else None
+
+    channels_to_remove, categories_to_remove = [], []
+
+    if old_channel_id:
+        ch = guild.get_channel(old_channel_id)
         if ch:
-            to_remove.append(ch)
+            channels_to_remove.append(ch)
+    if old_category_id:
+        cat = guild.get_channel(old_category_id)
+        if cat:
+            categories_to_remove.append(cat)
+
     for ch in guild.text_channels:
-        if ch.name == "perc-logs" and ch not in to_remove:
-            to_remove.append(ch)
-    for ch in to_remove:
+        if ch.name == "perc-logs" and ch not in channels_to_remove:
+            channels_to_remove.append(ch)
+    for cat in guild.categories:
+        if cat.name == "Perc Security" and cat not in categories_to_remove:
+            categories_to_remove.append(cat)
+
+    for ch in channels_to_remove:
         try:
-            await ch.delete(reason=f"{BRAND_NAME}: replacing log channel with a fresh one")
+            await ch.delete(reason=f"{BRAND_NAME}: replacing log setup")
+        except Exception:
+            pass
+    for cat in categories_to_remove:
+        try:
+            await cat.delete(reason=f"{BRAND_NAME}: replacing log setup")
         except Exception:
             pass
 
@@ -599,23 +941,31 @@ async def create_log_channel(guild, owner_member, cfg=None):
         owner_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
     }
+
     try:
+        category = await guild.create_category("Perc Security", overwrites=overwrites, reason=f"{BRAND_NAME}: log category")
+        try:
+            await category.edit(position=len(guild.categories) + 10)
+        except Exception:
+            pass
+
         channel = await guild.create_text_channel(
-            "perc-logs", overwrites=overwrites,
-            reason=f"{BRAND_NAME}: auto-created security log channel",
-            topic=f"🛡️ {BRAND_NAME} security logs — raid detection, lockdowns, and recovery events."
+            "perc-logs", category=category, overwrites=overwrites,
+            reason=f"{BRAND_NAME}: log channel",
+            topic=f"🛡️ {BRAND_NAME} security logs — raids, lockdowns, and recovery events."
         )
         try:
             await channel.send(embed=brand_embed(
-                f"🛡️ {BRAND_NAME} Logs Initialized",
-                "This channel shows real-time security events: raid detection, lockdowns, bans, and recovery actions.",
+                f"🛡️ {BRAND_NAME} Logs Are Live",
+                "This is where you'll see everything happen in real time — raids getting shut down, lockdowns, bans, all of it.",
                 EMBED_COLOR
             ))
         except Exception:
             pass
-        return channel, None
+        return channel, category, None
     except Exception as e:
-        return None, str(e)
+        return None, None, str(e)
+
 
 @bot.command()
 async def setup(ctx):
@@ -638,6 +988,7 @@ async def setup(ctx):
     )
     await ctx.send(embed=embed)
 
+
 @bot.command()
 async def resetup(ctx):
     if not isinstance(ctx.channel, discord.DMChannel):
@@ -649,6 +1000,7 @@ async def resetup(ctx):
         return await ctx.send(embed=brand_embed("No Config Found", "Use `!setup` to create one.", discord.Color.orange()))
     start_session(ctx.author.id, "await_user_id")
     await ctx.send(embed=brand_embed("🔄 Re-Running Setup", "**Step 1 of 3 — Confirm Your User ID**\nPaste your Discord User ID.", EMBED_COLOR))
+
 
 @bot.command()
 async def myconfig(ctx):
@@ -664,8 +1016,8 @@ async def myconfig(ctx):
     embed.add_field(name="Owner Role", value=cfg["owner_role_name"], inline=True)
     embed.add_field(name="Log Channel", value=log_ch.mention if log_ch else "Missing — run !fixlogs", inline=True)
     embed.add_field(name="Invite Link", value=cfg["invite_link"], inline=False)
-    embed.add_field(name="Trusted Users", value=str(len(cfg.get("trusted", []))), inline=True)
     await ctx.send(embed=embed)
+
 
 async def handle_setup_message(message):
     user_id = message.author.id
@@ -743,17 +1095,19 @@ async def handle_setup_message(message):
         member = guild.get_member(user_id)
         existing_cfg = get_config(user_id) or {}
         role, assigned, err = await setup_owner_role(guild, member)
-        log_channel, log_err = await create_log_channel(guild, member, existing_cfg)
+        log_channel, log_category, log_err = await create_log_channel(guild, member, existing_cfg)
 
-        configs[str(user_id)] = {
+        new_cfg = {
             "guild_id": data["guild_id"],
             "owner_role_name": "OWNER",
             "invite_link": content,
             "trusted": [],
             "log_channel_id": log_channel.id if log_channel else None,
+            "log_category_id": log_category.id if log_category else None,
             "setup_complete": True,
         }
-        save_configs()
+        configs[str(user_id)] = new_cfg
+        await db_upsert_config(user_id, new_cfg)
         rebuild_guild_index()
         del setup_sessions[user_id]
 
@@ -775,6 +1129,7 @@ async def handle_setup_message(message):
         return True
 
     return False
+
 
 def require_setup():
     async def predicate(ctx):
@@ -804,6 +1159,7 @@ async def invite(ctx):
     cfg = get_config(ctx.author.id)
     await ctx.send(embed=brand_embed("🔗 Server Invite", cfg['invite_link'], EMBED_COLOR))
 
+
 @bot.command()
 @require_setup()
 async def owner(ctx):
@@ -821,6 +1177,7 @@ async def owner(ctx):
     except discord.Forbidden:
         await ctx.send(embed=brand_embed("❌ Permission Denied", "Move my role above OWNER in Server Settings → Roles.", discord.Color.red()))
 
+
 @bot.command()
 @require_setup()
 async def unban(ctx):
@@ -835,23 +1192,6 @@ async def unban(ctx):
     except discord.Forbidden:
         await ctx.send(embed=brand_embed("❌ Permission Denied", "I lack Ban Members permission there.", discord.Color.red()))
 
-@bot.command()
-@require_setup()
-async def trust(ctx, member_id: int):
-    cfg = get_config(ctx.author.id)
-    if member_id not in cfg["trusted"]:
-        cfg["trusted"].append(member_id)
-        save_configs()
-    await ctx.send(embed=brand_embed("✅ Trusted", f"`{member_id}` added to trusted list.", discord.Color.green()))
-
-@bot.command()
-@require_setup()
-async def untrust(ctx, member_id: int):
-    cfg = get_config(ctx.author.id)
-    if member_id in cfg["trusted"]:
-        cfg["trusted"].remove(member_id)
-        save_configs()
-    await ctx.send(embed=brand_embed("✅ Untrusted", f"`{member_id}` removed from trusted list.", discord.Color.green()))
 
 @bot.command()
 @require_setup()
@@ -859,16 +1199,17 @@ async def fixlogs(ctx):
     cfg = get_config(ctx.author.id)
     guild = bot.get_guild(cfg["guild_id"])
     member = guild.get_member(ctx.author.id)
-    channel, err = await create_log_channel(guild, member, cfg)
+    channel, category, err = await create_log_channel(guild, member, cfg)
     if channel:
         cfg["log_channel_id"] = channel.id
-        save_configs()
+        cfg["log_category_id"] = category.id if category else None
+        await db_upsert_config(ctx.author.id, cfg)
         await ctx.send(embed=brand_embed("✅ Log Channel Refreshed", f"Fresh channel created: {channel.mention}", discord.Color.green()))
     else:
         await ctx.send(embed=brand_embed("❌ Failed", f"{err}\nCheck Manage Channels permission.", discord.Color.red()))
 
 # =================================================================
-# BACKUP / RESTORE
+# BACKUP / RESTORE  (Postgres-backed)
 # =================================================================
 
 def serialize_overwrites(channel):
@@ -878,6 +1219,19 @@ def serialize_overwrites(channel):
             allow, deny = ow.pair()
             result[f"role:{target.name}"] = {"allow": allow.value, "deny": deny.value}
     return result
+
+
+def build_overwrites(saved, role_map):
+    result = {}
+    for key, val in saved.items():
+        if key.startswith("role:"):
+            role = role_map.get(key.split("role:", 1)[1])
+            if role:
+                result[role] = discord.PermissionOverwrite.from_pair(
+                    discord.Permissions(val["allow"]), discord.Permissions(val["deny"])
+                )
+    return result
+
 
 async def do_backup(guild):
     data = {"roles": [], "categories": [], "channels": []}
@@ -905,28 +1259,23 @@ async def do_backup(guild):
         elif isinstance(ch, discord.VoiceChannel):
             entry.update(bitrate=ch.bitrate, user_limit=ch.user_limit)
         data["channels"].append(entry)
-    data["_backed_up_at"] = time.time()
-    with open(backup_path(guild.id), "w") as f:
-        json.dump(data, f, indent=2)
+
+    backed_up_at = time.time()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO backups (guild_id, data, backed_up_at)
+            VALUES ($1,$2,$3)
+            ON CONFLICT (guild_id) DO UPDATE SET data=$2, backed_up_at=$3
+        """, guild.id, json.dumps(data), backed_up_at)
     return data
 
-def build_overwrites(saved, role_map):
-    result = {}
-    for key, val in saved.items():
-        if key.startswith("role:"):
-            role = role_map.get(key.split("role:", 1)[1])
-            if role:
-                result[role] = discord.PermissionOverwrite.from_pair(
-                    discord.Permissions(val["allow"]), discord.Permissions(val["deny"])
-                )
-    return result
 
 async def do_restore(guild, dm):
-    path = backup_path(guild.id)
-    if not os.path.exists(path):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT data FROM backups WHERE guild_id=$1", guild.id)
+    if not row:
         return await dm.send(embed=brand_embed("❌ No Backup Found", color=discord.Color.red()))
-    with open(path) as f:
-        data = json.load(f)
+    data = json.loads(row["data"])
 
     await dm.send(embed=brand_embed("🔧 Restoring Roles...", color=EMBED_COLOR))
     role_map = {}
@@ -973,6 +1322,7 @@ async def do_restore(guild, dm):
 
     await dm.send(embed=brand_embed("✅ Restore Complete", "Ordering/pins/per-member overwrites may need manual fixing.", discord.Color.green()))
 
+
 @bot.command()
 @require_setup()
 async def backup(ctx):
@@ -980,6 +1330,7 @@ async def backup(ctx):
     guild = bot.get_guild(cfg["guild_id"])
     await do_backup(guild)
     await ctx.send(embed=brand_embed("✅ Backup Saved", color=discord.Color.green()))
+
 
 @bot.command()
 @require_setup()
@@ -989,10 +1340,8 @@ async def restore(ctx):
     await do_restore(guild, ctx)
 
 # =================================================================
-# LOCKDOWN
+# LOCKDOWN  (Postgres-backed)
 # =================================================================
-
-lockdown_active_map = {}
 
 async def do_lockdown(guild):
     everyone = guild.default_role
@@ -1018,17 +1367,23 @@ async def do_lockdown(guild):
             await asyncio.sleep(0.3)
         except Exception:
             pass
-    with open(lockdown_path(guild.id), "w") as f:
-        json.dump(state, f)
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO lockdowns (guild_id, state) VALUES ($1,$2)
+            ON CONFLICT (guild_id) DO UPDATE SET state=$2
+        """, guild.id, json.dumps(state))
+
     lockdown_active_map[guild.id] = True
     return count
 
+
 async def do_unlock(guild):
-    path = lockdown_path(guild.id)
-    if not os.path.exists(path):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT state FROM lockdowns WHERE guild_id=$1", guild.id)
+    if not row:
         return 0
-    with open(path) as f:
-        state = json.load(f)
+    state = json.loads(row["state"])
     everyone = guild.default_role
     count = 0
     for channel_id_str, info in state.items():
@@ -1046,9 +1401,13 @@ async def do_unlock(guild):
             await asyncio.sleep(0.3)
         except Exception:
             pass
-    os.remove(path)
+
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM lockdowns WHERE guild_id=$1", guild.id)
+
     lockdown_active_map[guild.id] = False
     return count
+
 
 @bot.command()
 @require_setup()
@@ -1062,12 +1421,15 @@ async def lockdown(ctx):
         f"Manually activated by the owner. **{count}** channels restricted (exact prior state saved).",
         discord.Color.red())
 
+
 @bot.command()
 @require_setup()
 async def unlock(ctx):
     cfg = get_config(ctx.author.id)
     guild = bot.get_guild(cfg["guild_id"])
-    if not lockdown_active_map.get(guild.id) and not os.path.exists(lockdown_path(guild.id)):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT 1 FROM lockdowns WHERE guild_id=$1", guild.id)
+    if not lockdown_active_map.get(guild.id) and not row:
         return await ctx.send(embed=brand_embed("Not Locked", color=EMBED_COLOR))
     count = await do_unlock(guild)
     await log_embed(ctx.author.id, guild, "🔓 Lockdown Lifted",
@@ -1077,8 +1439,6 @@ async def unlock(ctx):
 # =================================================================
 # KILL SWITCH
 # =================================================================
-
-pending_kills = {}
 
 @bot.command()
 @require_setup()
@@ -1100,6 +1460,7 @@ async def kill(ctx):
             await ctx.send(embed=brand_embed("⏱️ Timed Out", "Cancelled.", discord.Color.orange()))
     bot.loop.create_task(expire(ctx.author.id, 1, code))
 
+
 @bot.command()
 @require_setup()
 async def cancel(ctx):
@@ -1108,6 +1469,7 @@ async def cancel(ctx):
         await ctx.send(embed=brand_embed("✅ Cancelled", "Kill sequence cancelled.", discord.Color.green()))
     else:
         await ctx.send(embed=brand_embed("Nothing Pending", color=EMBED_COLOR))
+
 
 async def execute_kill(guild, dm):
     deleted_c = failed_c = deleted_r = failed_r = 0
@@ -1134,7 +1496,7 @@ async def execute_kill(guild, dm):
     await dm.send(embed=embed)
 
 # =================================================================
-# STATUS / HELP
+# STATUS
 # =================================================================
 
 @bot.command()
@@ -1143,13 +1505,13 @@ async def status(ctx):
     cfg = get_config(ctx.author.id)
     guild = bot.get_guild(cfg["guild_id"])
     perms = guild.me.guild_permissions
-    backup_exists = os.path.exists(backup_path(guild.id))
+
+    async with pool.acquire() as conn:
+        backup_row = await conn.fetchrow("SELECT backed_up_at FROM backups WHERE guild_id=$1", guild.id)
     backup_age = "Never"
-    if backup_exists:
-        with open(backup_path(guild.id)) as f:
-            ts = json.load(f).get("_backed_up_at")
-        if ts:
-            backup_age = f"{int((time.time()-ts)//60)}m ago"
+    if backup_row and backup_row["backed_up_at"]:
+        backup_age = f"{int((time.time() - backup_row['backed_up_at']) // 60)}m ago"
+
     status_info = get_license_status(ctx.author.id)
     log_ch = guild.get_channel(cfg.get("log_channel_id")) if cfg.get("log_channel_id") else None
 
@@ -1169,38 +1531,43 @@ async def status(ctx):
     embed.add_field(name="Permissions", value=perms_text, inline=False)
     await ctx.send(embed=embed)
 
+# =================================================================
+# HELP
+# =================================================================
+
 @bot.command(name="help")
 async def custom_help(ctx):
     if not isinstance(ctx.channel, discord.DMChannel):
         return
-    embed = brand_embed(f"🛡️ {BRAND_NAME} — Command Center", color=EMBED_COLOR)
-    embed.add_field(name="🚀 Getting Started", value=(
-        "`!activate <key>` — activate your license\n"
-        "`!mylicense` — check license status\n"
-        "`!setup` / `!resetup` — configure your server\n"
-        "`!myconfig` — view your settings\n"
-        "`!useridswitch <reason>` — move key to a new account"
+    embed = brand_embed(f"🛡️ {BRAND_NAME}", "Here's everything I can do for you.", EMBED_COLOR)
+    embed.add_field(name="🔑 License & Setup", value=(
+        "`!activate <key>` — plug in your key and you're live\n"
+        "`!mylicense` — see how much time you've got left\n"
+        "`!setup` / `!resetup` — hook me up to your server\n"
+        "`!myconfig` — check what's currently configured\n"
+        "`!useridswitch <reason>` — moved accounts? bring your key with you"
     ), inline=False)
-    embed.add_field(name="🔑 Recovery", value=(
-        "`!invite` — get invite link\n"
-        "`!owner` — restore OWNER role\n"
-        "`!unban` — unban yourself"
+    embed.add_field(name="🚑 If Something Goes Wrong", value=(
+        "`!invite` — grab your server's invite link\n"
+        "`!owner` — get your OWNER role back\n"
+        "`!unban` — unban yourself if you got hit"
     ), inline=False)
-    embed.add_field(name="💾 Backup", value="`!backup` / `!restore`", inline=False)
-    embed.add_field(name="💥 Emergency", value="`!kill` (2-step confirm) / `!cancel`", inline=False)
-    embed.add_field(name="🔐 Server Control", value="`!lockdown` / `!unlock`", inline=False)
-    embed.add_field(name="🤝 Trust", value="`!trust <id>` / `!untrust <id>`", inline=False)
-    embed.add_field(name="📜 Logs", value="`!fixlogs` — refresh the security log channel", inline=False)
-    embed.add_field(name="📊 Status", value="`!status`", inline=False)
-    embed.add_field(name="🛡️ Automatic Protection", value=(
-        "• Auto-unban if you're banned\n"
-        "• Anti-nuke: detects & neutralizes mass bans/kicks/deletions\n"
-        "• Mass-join raid detection with auto-lockdown\n"
-        "• All events logged to your private #perc-logs channel"
+    embed.add_field(name="💾 Backups", value="`!backup` to save the server's current state, `!restore` to bring it back later.", inline=False)
+    embed.add_field(name="💥 The Nuclear Option", value="`!kill` wipes everything — it'll double-check with you twice before doing it. `!cancel` backs out at any point.", inline=False)
+    embed.add_field(name="🔐 Locking Things Down", value="`!lockdown` freezes the server, `!unlock` puts it back exactly how it was.", inline=False)
+    embed.add_field(name="📜 Logs", value="`!fixlogs` — rebuilds your log channel fresh if it ever breaks or disappears.", inline=False)
+    embed.add_field(name="📊 Health Check", value="`!status` — a quick look at what's working and what isn't.", inline=False)
+    embed.add_field(name="🛡️ What I Do Without Being Asked", value=(
+        "If you get banned, I unban you.\n"
+        "If someone starts mass-banning or mass-deleting, I stop them and reverse it.\n"
+        "If a bunch of accounts join at once, I lock things down before it turns into a mess.\n"
+        "Everything gets logged so you're never left wondering what happened."
     ), inline=False)
     if is_master(ctx.author.id):
-        embed.add_field(name="🔑 Admin Only", value=(
-            "`!genk <duration> <user_id> [count]`\n"
+        embed.add_field(name="🔑 Just for You", value=(
+            "`!bought <user_id> <duration> [price]` — sell a key and send it in one step\n"
+            "`!stats` — revenue, sales breakdown, raids stopped, active licenses\n"
+            "`!genk <duration> <user_id> [count]` — generate without sending\n"
             "`!bl <id>` / `!unbl <id>`\n"
             "`!switchrequests` / `!approveswitch <id>` / `!denyswitch <id> <reason>`"
         ), inline=False)
@@ -1262,9 +1629,11 @@ pending_raid_welcomes = set()
 recent_joins_map = {}
 last_mass_join_map = {}
 
+
 def _prune(lst, window):
     now = time.time()
     return [t for t in lst if now - t <= window]
+
 
 async def try_unban_owner(guild, owner_id, cfg, reason):
     try:
@@ -1290,6 +1659,7 @@ async def try_unban_owner(guild, owner_id, cfg, reason):
     except Exception:
         pass
 
+
 async def handle_raid(guild, owner_id, cfg, actor, action_desc, victim_ids=None):
     member = guild.get_member(actor.id)
     neutralized = False
@@ -1308,6 +1678,12 @@ async def handle_raid(guild, owner_id, cfg, actor, action_desc, victim_ids=None)
                 method = "Roles stripped"
             except Exception:
                 method = "Failed"
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO raid_events (guild_id, owner_id, actor_id, action_desc, neutralized, created_at)
+            VALUES ($1,$2,$3,$4,$5,$6)
+        """, guild.id, owner_id, actor.id, action_desc, neutralized, time.time())
 
     await log_embed(
         owner_id, guild, "🚨 Raid Detected & Response Executed",
@@ -1343,6 +1719,7 @@ async def handle_raid(guild, owner_id, cfg, actor, action_desc, victim_ids=None)
             except Exception:
                 pass
 
+
 @bot.event
 async def on_member_join(member):
     guild = member.guild
@@ -1372,6 +1749,7 @@ async def on_member_join(member):
         )
         await do_lockdown(guild)
 
+
 @bot.event
 async def on_member_ban(guild, user):
     owner_id = get_owner_id_for_guild(guild.id)
@@ -1397,6 +1775,7 @@ async def on_member_ban(guild, user):
     if len(recent_bans[actor.id]) >= RAID_BAN_THRESHOLD and actor.id not in neutralized_actors:
         neutralized_actors.add(actor.id)
         await handle_raid(guild, owner_id, cfg, actor, "mass banning", recent_ban_victims.get(actor.id, []))
+
 
 @bot.event
 async def on_member_remove(member):
@@ -1424,6 +1803,7 @@ async def on_member_remove(member):
         neutralized_actors.add(actor.id)
         await handle_raid(guild, owner_id, cfg, actor, "mass kicking", [member.id])
 
+
 @bot.event
 async def on_guild_channel_delete(channel):
     guild = channel.guild
@@ -1441,6 +1821,7 @@ async def on_guild_channel_delete(channel):
     if len(recent_ch_del[actor.id]) >= RAID_CHANNEL_DELETE_THRESHOLD and actor.id not in neutralized_actors:
         neutralized_actors.add(actor.id)
         await handle_raid(guild, owner_id, cfg, actor, "mass channel deletion")
+
 
 @bot.event
 async def on_guild_role_delete(role):
@@ -1467,7 +1848,7 @@ async def on_guild_role_delete(role):
 @tasks.loop(hours=24)
 async def check_expirations():
     now = time.time()
-    for user_id_str, entry in licenses.get("activations", {}).items():
+    for user_id_str, entry in list(licenses.get("activations", {}).items()):
         expires_at = entry.get("expires_at")
         if expires_at is None:
             continue
@@ -1481,7 +1862,7 @@ async def check_expirations():
             except Exception:
                 pass
             entry["warned_3d"] = True
-            save_licenses()
+            await db_upsert_activation(int(user_id_str), entry)
 
         elif remaining <= 0 and not entry.get("warned_expired"):
             try:
@@ -1491,16 +1872,17 @@ async def check_expirations():
             except Exception:
                 pass
             entry["warned_expired"] = True
-            save_licenses()
+            await db_upsert_activation(int(user_id_str), entry)
+
 
 @check_expirations.before_loop
 async def before_check():
     await bot.wait_until_ready()
 
+
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}. Serving {len(configs)} configured server(s). Data dir: {DATA_DIR}")
-    if not check_expirations.is_running():
-        check_expirations.start()
+    print(f"Logged in as {bot.user}. Serving {len(configs)} configured server(s).")
+
 
 bot.run(BOT_TOKEN)
