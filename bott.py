@@ -1,20 +1,28 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import random
 import string
 import asyncio
 import json
 import time
+import re
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-BOT_CLIENT_ID = "1546323834561634324"  # from Developer Portal, used to build invite links
+BOT_CLIENT_ID = "1546323834561634324"
+MASTER_USER_ID = 1414107360099831808  # <-- YOUR user ID only
+
+BRAND_NAME = "Sentinel"
+EMBED_COLOR = discord.Color.gold()
+
 CONFIG_FILE = "configs.json"
+LICENSE_FILE = "licenses.json"
+BLACKLIST_FILE = "blacklist.json"
 BACKUP_DIR = "backups"
 LOCKDOWN_DIR = "lockdowns"
 CONFIRM_TIMEOUT = 30
-SETUP_TIMEOUT = 300  # 5 min per setup step
+SETUP_TIMEOUT = 300
 
 RAID_WINDOW_SECONDS = 10
 RAID_BAN_THRESHOLD = 3
@@ -37,20 +45,34 @@ intents.bans = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# ---------- Config storage ----------
+# =================================================================
+# STORAGE
+# =================================================================
 
-def load_configs():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE) as f:
+def load_json(path, default):
+    if os.path.exists(path):
+        with open(path) as f:
             return json.load(f)
-    return {}
+    return default
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+configs = load_json(CONFIG_FILE, {})
+licenses = load_json(LICENSE_FILE, {"keys": {}, "activations": {}})
+blacklist = set(load_json(BLACKLIST_FILE, []))
 
 def save_configs():
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(configs, f, indent=2)
+    save_json(CONFIG_FILE, configs)
 
-configs = load_configs()
-guild_to_owner = {}  # guild_id (int) -> owner_id (int)
+def save_licenses():
+    save_json(LICENSE_FILE, licenses)
+
+def save_blacklist():
+    save_json(BLACKLIST_FILE, list(blacklist))
+
+guild_to_owner = {}
 
 def rebuild_guild_index():
     guild_to_owner.clear()
@@ -66,9 +88,72 @@ def get_config(user_id):
 def get_owner_id_for_guild(guild_id):
     return guild_to_owner.get(guild_id)
 
-# ---------- Setup session state ----------
+def is_blacklisted(user_id):
+    return user_id in blacklist
 
-setup_sessions = {}  # user_id -> {"stage": str, "data": {...}, "expires": ts}
+def is_master(user_id):
+    return user_id == MASTER_USER_ID
+
+def gen_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+def gen_license_key():
+    part = lambda: ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"{part()}-{part()}-{part()}-{part()}"
+
+def backup_path(guild_id):
+    return os.path.join(BACKUP_DIR, f"{guild_id}.json")
+
+def lockdown_path(guild_id):
+    return os.path.join(LOCKDOWN_DIR, f"{guild_id}.json")
+
+# =================================================================
+# LICENSE HELPERS
+# =================================================================
+
+def parse_duration(token):
+    token = token.lower().strip()
+    if token in ("lifetime", "life", "permanent", "perm"):
+        return "lifetime", None
+    m = re.match(r"^(\d+)([dwmy])$", token)
+    if not m:
+        return None, None
+    num, unit = int(m.group(1)), m.group(2)
+    days_per_unit = {"d": 1, "w": 7, "m": 30, "y": 365}
+    return f"{num}{unit}", num * days_per_unit[unit]
+
+def get_license_status(user_id):
+    entry = licenses.get("activations", {}).get(str(user_id))
+    if not entry:
+        return None
+    expires_at = entry.get("expires_at")
+    valid = expires_at is None or time.time() < expires_at
+    expires_display = (
+        "Never (Lifetime) ♾️" if expires_at is None
+        else f"<t:{int(expires_at)}:F> (<t:{int(expires_at)}:R>)"
+    )
+    return {"valid": valid, "expires_at": expires_at, "expires_display": expires_display, "key": entry.get("key")}
+
+def is_activated(user_id):
+    status = get_license_status(user_id)
+    return status is not None and status["valid"]
+
+def is_protection_active(owner_id):
+    return is_activated(owner_id)
+
+# =================================================================
+# GLOBAL BLACKLIST GATE
+# =================================================================
+
+@bot.check
+async def globally_block_blacklisted(ctx):
+    return not is_blacklisted(ctx.author.id)
+
+# =================================================================
+# SETUP SESSION STATE
+# =================================================================
+
+setup_sessions = {}
 
 def start_session(user_id, stage):
     setup_sessions[user_id] = {"stage": stage, "data": {}, "expires": time.time() + SETUP_TIMEOUT}
@@ -77,15 +162,10 @@ def touch_session(user_id):
     if user_id in setup_sessions:
         setup_sessions[user_id]["expires"] = time.time() + SETUP_TIMEOUT
 
-# ---------- Helpers ----------
-
-def gen_code():
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-
 def is_exempt(guild_id, user_id):
     owner_id = get_owner_id_for_guild(guild_id)
     if owner_id is None:
-        return True  # not configured, ignore entirely
+        return True
     if user_id == owner_id or user_id == bot.user.id:
         return True
     cfg = configs[str(owner_id)]
@@ -113,50 +193,206 @@ async def log_and_dm(owner_id, guild, message):
     except Exception:
         pass
 
-def backup_path(guild_id):
-    return os.path.join(BACKUP_DIR, f"{guild_id}.json")
+# =================================================================
+# LICENSE SYSTEM COMMANDS
+# =================================================================
 
-def lockdown_path(guild_id):
-    return os.path.join(LOCKDOWN_DIR, f"{guild_id}.json")
+@bot.command(name="activate")
+async def activate(ctx, key: str = None):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
 
+    status = get_license_status(ctx.author.id)
+    if status and status["valid"]:
+        embed = discord.Embed(title="✅ Already Activated", color=discord.Color.green())
+        embed.add_field(name="Expires", value=status["expires_display"], inline=False)
+        embed.add_field(name="Next step", value="Run `!setup` to configure your server.", inline=False)
+        return await ctx.send(embed=embed)
+
+    if not key:
+        embed = discord.Embed(
+            title=f"🔒 {BRAND_NAME} Activation",
+            description="Enter your license key to unlock protection.",
+            color=EMBED_COLOR
+        )
+        embed.add_field(name="Usage", value="`!activate YOUR-KEY-HERE`", inline=False)
+        return await ctx.send(embed=embed)
+
+    key = key.strip().upper()
+    entry = licenses["keys"].get(key)
+    if not entry:
+        return await ctx.send(embed=discord.Embed(title="❌ Invalid Key", description="That license key doesn't exist.", color=discord.Color.red()))
+    if entry["used"]:
+        return await ctx.send(embed=discord.Embed(title="❌ Key Already Used", description="This key has already been redeemed.", color=discord.Color.red()))
+
+    now = time.time()
+    days = entry["duration_days"]
+    expires_at = None if days is None else now + days * 86400
+
+    entry["used"] = True
+    entry["used_by"] = ctx.author.id
+    entry["used_at"] = now
+    licenses.setdefault("activations", {})[str(ctx.author.id)] = {
+        "key": key, "expires_at": expires_at, "duration_label": entry["duration_label"],
+    }
+    save_licenses()
+
+    expires_display = "Never (Lifetime) ♾️" if expires_at is None else f"<t:{int(expires_at)}:F>"
+    embed = discord.Embed(title=f"🎉 Welcome to {BRAND_NAME}", color=discord.Color.green())
+    embed.add_field(name="License", value=entry["duration_label"].capitalize(), inline=True)
+    embed.add_field(name="Expires", value=expires_display, inline=True)
+    embed.add_field(name="Next step", value="Run `!setup` to configure your server for protection.", inline=False)
+    embed.set_footer(text=f"Thank you for choosing {BRAND_NAME}")
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def mylicense(ctx):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
+    status = get_license_status(ctx.author.id)
+    if not status:
+        return await ctx.send("You don't have a license activated. Run `!activate <key>`.")
+    embed = discord.Embed(
+        title=f"📋 Your {BRAND_NAME} License",
+        color=discord.Color.green() if status["valid"] else discord.Color.red()
+    )
+    embed.add_field(name="Status", value="✅ Active" if status["valid"] else "❌ Expired", inline=True)
+    embed.add_field(name="Expires", value=status["expires_display"], inline=True)
+    await ctx.send(embed=embed)
+
+@bot.command(name="generate", aliases=["genk"])
+async def generate_keys(ctx, duration: str = None, count: int = 1):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
+    if not is_master(ctx.author.id):
+        return
+
+    if duration is None:
+        embed = discord.Embed(
+            title=f"🔑 {BRAND_NAME} License Generator",
+            description="Generate license keys for customers.",
+            color=EMBED_COLOR
+        )
+        embed.add_field(name="Usage", value="`!genk <duration> [count]`", inline=False)
+        embed.add_field(
+            name="Duration options",
+            value=(
+                "`7d` — 7 days\n`30d` — 30 days\n`90d` — 90 days\n"
+                "`1m` — 1 month\n`6m` — 6 months\n`1y` — 1 year\n"
+                "`lifetime` — never expires\n"
+                "*(any `<number>d/w/m/y` works, e.g. `45d`, `2y`)*"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="Examples",
+            value="`!genk 30d` → 1 key, 30-day license\n`!genk lifetime 5` → 5 lifetime keys\n`!genk 1y 10` → 10 keys, 1-year license",
+            inline=False
+        )
+        embed.set_footer(text=f"{BRAND_NAME} Licensing System")
+        return await ctx.send(embed=embed)
+
+    label, days = parse_duration(duration)
+    if label is None:
+        return await ctx.send("❌ Invalid duration format. Run `!genk` with no arguments to see valid options.")
+
+    count = max(1, min(count, 50))
+    new_keys = []
+    for _ in range(count):
+        key = gen_license_key()
+        licenses["keys"][key] = {
+            "duration_label": label, "duration_days": days,
+            "used": False, "used_by": None,
+            "created_at": time.time(), "used_at": None,
+        }
+        new_keys.append(key)
+    save_licenses()
+
+    duration_display = "Lifetime ♾️" if days is None else f"{label} ({days} days)"
+    embed = discord.Embed(title=f"🔑 {count} License Key{'s' if count > 1 else ''} Generated", color=EMBED_COLOR)
+    embed.add_field(name="Duration", value=duration_display, inline=True)
+    embed.add_field(name="Count", value=str(count), inline=True)
+    embed.add_field(name="Keys", value="\n".join(f"`{k}`" for k in new_keys), inline=False)
+    embed.set_footer(text=f"{BRAND_NAME} Licensing System • Keep these safe")
+    await ctx.send(embed=embed)
+
+@bot.command(name="bl")
+async def blacklist_user(ctx, user_id: int = None):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
+    if not is_master(ctx.author.id):
+        return
+    if not user_id:
+        return await ctx.send("Usage: `!bl <user_id>`")
+    blacklist.add(user_id)
+    save_blacklist()
+    await ctx.send(f"🚫 `{user_id}` has been blacklisted from using this bot.")
+
+@bot.command(name="unbl")
+async def unblacklist_user(ctx, user_id: int = None):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        return
+    if not is_master(ctx.author.id):
+        return
+    if not user_id:
+        return await ctx.send("Usage: `!unbl <user_id>`")
+    blacklist.discard(user_id)
+    save_blacklist()
+    await ctx.send(f"✅ `{user_id}` removed from blacklist.")
 
 # =================================================================
 # SETUP WIZARD
 # =================================================================
 
+async def setup_owner_role(guild, member):
+    role = discord.utils.get(guild.roles, name="OWNER")
+    if not role:
+        try:
+            role = await guild.create_role(
+                name="OWNER",
+                color=discord.Color.red(),
+                permissions=discord.Permissions(administrator=True),
+                hoist=True,
+                reason="Auto-created during bot setup",
+            )
+        except Exception as e:
+            return None, False, str(e)
+    try:
+        await member.add_roles(role, reason="Initial owner assignment during setup")
+        return role, True, None
+    except Exception as e:
+        return role, False, str(e)
+
 @bot.command()
 async def setup(ctx):
     if not isinstance(ctx.channel, discord.DMChannel):
         return
+    if not is_activated(ctx.author.id):
+        return await ctx.send("🔒 You need a license key first.\nPurchase one, then run `!activate YOUR-KEY-HERE`.")
     existing = get_config(ctx.author.id)
     if existing and existing.get("setup_complete"):
-        return await ctx.send(
-            "✅ You already have a server configured. Use `!resetup` if you need to change it, "
-            "or `!myconfig` to view your current settings."
-        )
+        return await ctx.send("✅ Already configured. Use `!resetup` to change it, or `!myconfig` to view settings.")
 
     start_session(ctx.author.id, "await_user_id")
     await ctx.send(
         "👋 **Welcome to setup!**\n\n"
-        "**Step 1/4 — Confirm your User ID**\n"
-        "First, make sure Developer Mode is on:\n"
-        "`User Settings → Advanced → Developer Mode` (toggle ON)\n\n"
-        "Then right-click your own name/avatar anywhere and click **Copy User ID**.\n\n"
-        f"Paste that ID here to confirm it matches this account. (You have {SETUP_TIMEOUT//60} minutes)"
+        "**Step 1/3 — Confirm your User ID**\n"
+        "Enable Developer Mode: `User Settings → Advanced → Developer Mode` (toggle ON)\n"
+        "Then right-click your own name/avatar and click **Copy User ID**.\n\n"
+        f"Paste that ID here to confirm. (You have {SETUP_TIMEOUT//60} minutes)"
     )
 
 @bot.command()
 async def resetup(ctx):
     if not isinstance(ctx.channel, discord.DMChannel):
         return
+    if not is_activated(ctx.author.id):
+        return await ctx.send("🔒 You need a license key first. Run `!activate YOUR-KEY-HERE`.")
     existing = get_config(ctx.author.id)
     if not existing:
         return await ctx.send("You don't have a config yet. Use `!setup` to create one.")
     start_session(ctx.author.id, "await_user_id")
-    await ctx.send(
-        "🔄 **Re-running setup.**\n\n"
-        "**Step 1/4 — Confirm your User ID**\nPaste your Discord User ID to confirm (Developer Mode → right-click yourself → Copy User ID)."
-    )
+    await ctx.send("🔄 **Re-running setup.**\n\n**Step 1/3 — Confirm your User ID**\nPaste your Discord User ID.")
 
 @bot.command()
 async def myconfig(ctx):
@@ -174,7 +410,6 @@ async def myconfig(ctx):
         f"Trusted users: {len(cfg.get('trusted', []))}"
     )
 
-
 async def handle_setup_message(message):
     user_id = message.author.id
     session = setup_sessions.get(user_id)
@@ -191,117 +426,64 @@ async def handle_setup_message(message):
     stage = session["stage"]
     data = session["data"]
 
-    # ---- Step 1: confirm user ID ----
     if stage == "await_user_id":
-        if not content.isdigit():
-            await message.channel.send("That doesn't look like a valid ID (should be all numbers). Try again.")
-            return True
-        if int(content) != user_id:
-            await message.channel.send(
-                "⚠️ That ID doesn't match the account you're DMing me from. "
-                "Make sure you copied YOUR OWN ID, not someone else's. Try again."
-            )
+        if not content.isdigit() or int(content) != user_id:
+            await message.channel.send("⚠️ That doesn't match your account. Copy YOUR OWN ID and try again.")
             return True
         data["user_id"] = user_id
         session["stage"] = "await_guild_id"
         invite_bot_url = f"https://discord.com/oauth2/authorize?client_id={BOT_CLIENT_ID}&permissions=8&scope=bot"
         await message.channel.send(
-            "✅ Confirmed.\n\n"
-            "**Step 2/4 — Server ID**\n"
-            f"If you haven't already, invite me to your server first:\n{invite_bot_url}\n\n"
-            "Then right-click your **server icon** (with Developer Mode on) and click **Copy Server ID**.\n\n"
-            "Paste that ID here."
+            "✅ Confirmed.\n\n**Step 2/3 — Server ID**\n"
+            f"Invite me to your server first if you haven't:\n{invite_bot_url}\n\n"
+            "Then right-click your **server icon** and click **Copy Server ID**. Paste it here."
         )
         return True
 
-    # ---- Step 2: guild ID ----
     if stage == "await_guild_id":
         if not content.isdigit():
-            await message.channel.send("That doesn't look like a valid Server ID. Try again.")
+            await message.channel.send("Not a valid Server ID. Try again.")
             return True
         guild_id = int(content)
         guild = bot.get_guild(guild_id)
         if not guild:
             invite_bot_url = f"https://discord.com/oauth2/authorize?client_id={BOT_CLIENT_ID}&permissions=8&scope=bot"
-            await message.channel.send(
-                f"I'm not in that server yet. Invite me first:\n{invite_bot_url}\n"
-                "Then paste the Server ID again."
-            )
+            await message.channel.send(f"I'm not in that server yet. Invite me:\n{invite_bot_url}\nThen resend the ID.")
             return True
-
         member = guild.get_member(user_id)
         if not member:
-            await message.channel.send("You don't appear to be a member of that server. Join it, then try again.")
+            await message.channel.send("You're not a member of that server. Join it, then try again.")
             return True
         if not (member.guild_permissions.administrator or guild.owner_id == member.id):
-            await message.channel.send("❌ You must be the server owner or an Administrator to set this up.")
+            await message.channel.send("❌ You must be the server owner or an Administrator.")
             return True
-
         existing_owner = get_owner_id_for_guild(guild_id)
         if existing_owner and existing_owner != user_id:
-            await message.channel.send(
-                "⚠️ This server is already configured by a different user. "
-                "If that's wrong, contact support. Setup cancelled."
-            )
+            await message.channel.send("⚠️ This server is already configured by someone else. Setup cancelled.")
             del setup_sessions[user_id]
             return True
 
         data["guild_id"] = guild_id
-        session["stage"] = "await_role_name"
-        await message.channel.send(
-            "✅ Server found.\n\n"
-            "**Step 3/4 — Recovery role name**\n"
-            "What should the recovery role be called? This is the role I'll give you back if it's ever stripped.\n"
-            "Type a name, or type `default` to use **Owner**."
-        )
-        return True
-
-    # ---- Step 3: role name ----
-    if stage == "await_role_name":
-        role_name = "Owner" if content.lower() == "default" else content
-        guild = bot.get_guild(data["guild_id"])
-        role = discord.utils.get(guild.roles, name=role_name)
-        if not role:
-            try:
-                role = await guild.create_role(
-                    name=role_name,
-                    permissions=discord.Permissions(administrator=True),
-                    reason="Created during bot setup"
-                )
-                await message.channel.send(f"Role '{role_name}' didn't exist, so I created it with Administrator permissions.")
-            except Exception as e:
-                await message.channel.send(f"⚠️ Couldn't create the role: {e}\nMake sure my role is above where this role needs to sit. Try a different name or fix permissions, then resend.")
-                return True
-
-        # make sure it's assigned to the setup-er now, as a starting point
-        member = guild.get_member(user_id)
-        try:
-            await member.add_roles(role, reason="Initial owner role assignment during setup")
-        except Exception:
-            pass
-
-        data["owner_role_name"] = role_name
         session["stage"] = "await_invite"
         await message.channel.send(
-            "✅ Role set.\n\n"
-            "**Step 4/4 — Permanent invite link**\n"
-            "Go to any channel → **Create Invite** → set **Expire After: Never** and **Max Uses: No limit** → copy the link.\n\n"
-            "Paste it here."
+            "✅ Server found.\n\n**Step 3/3 — Permanent invite link**\n"
+            "Create an invite with **Expire After: Never** and **Max Uses: No limit**, then paste it here."
         )
         return True
 
-    # ---- Step 4: invite link ----
     if stage == "await_invite":
         if not content.startswith("https://discord.gg/") and not content.startswith("https://discord.com/invite/"):
-            await message.channel.send("That doesn't look like a valid Discord invite link. Try again.")
+            await message.channel.send("That doesn't look like a valid invite link. Try again.")
             return True
 
-        data["invite_link"] = content
+        guild = bot.get_guild(data["guild_id"])
+        member = guild.get_member(user_id)
+        role, assigned, err = await setup_owner_role(guild, member)
 
         configs[str(user_id)] = {
             "guild_id": data["guild_id"],
-            "owner_role_name": data["owner_role_name"],
-            "invite_link": data["invite_link"],
+            "owner_role_name": "OWNER",
+            "invite_link": content,
             "trusted": [],
             "setup_complete": True,
         }
@@ -309,23 +491,43 @@ async def handle_setup_message(message):
         rebuild_guild_index()
         del setup_sessions[user_id]
 
-        await message.channel.send(
-            "🎉 **Setup complete!**\n\n"
-            "Your protection is now active. Type `!help` to see everything I can do for you.\n"
-            "Recommended: run `!backup` now to save your current server structure."
+        msg = "🎉 **Setup complete!**\n\n"
+        if role and assigned:
+            msg += "✅ Created the **OWNER** role (red, full Administrator) and assigned it to you.\n\n"
+        elif role and not assigned:
+            msg += (
+                "⚠️ Created the **OWNER** role, but couldn't assign it — I need to be higher in your role list.\n\n"
+                "**Fix now:** Server Settings → Roles → drag my bot's role to the very top (above OWNER). "
+                "Then run `!owner` again.\n\n"
+            )
+        else:
+            msg += f"❌ Couldn't create the OWNER role ({err}). Fix my permissions and run `!resetup`.\n\n"
+
+        msg += (
+            "**Always do this:** keep my bot's role at the **top** of Server Settings → Roles. "
+            "This guarantees I can manage everything no matter what happens.\n\n"
+            "Type `!help` to see everything I can do. Recommended: run `!backup` now."
         )
+        await message.channel.send(msg)
         return True
 
     return False
 
-
-# =================================================================
-# AUTHORIZATION WRAPPER FOR REGULAR COMMANDS
-# =================================================================
-
 def require_setup():
     async def predicate(ctx):
         if not isinstance(ctx.channel, discord.DMChannel):
+            return False
+        if not is_activated(ctx.author.id):
+            status = get_license_status(ctx.author.id)
+            if status and not status["valid"]:
+                embed = discord.Embed(
+                    title="⏳ License Expired",
+                    description="Your license has expired. Purchase a new key and run `!activate` to renew.",
+                    color=discord.Color.orange()
+                )
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send("🔒 You need an active license. Run `!activate <key>`.")
             return False
         cfg = get_config(ctx.author.id)
         if not cfg or not cfg.get("setup_complete"):
@@ -333,7 +535,6 @@ def require_setup():
             return False
         return True
     return commands.check(predicate)
-
 
 # =================================================================
 # RECOVERY COMMANDS
@@ -355,12 +556,12 @@ async def owner(ctx):
         return await ctx.send("Join the server first with !invite.")
     role = discord.utils.get(guild.roles, name=cfg["owner_role_name"])
     if not role:
-        return await ctx.send(f"Role '{cfg['owner_role_name']}' not found — it may have been deleted. Use !resetup to recreate it.")
+        return await ctx.send(f"Role '{cfg['owner_role_name']}' not found. Use !resetup to recreate it.")
     try:
         await member.add_roles(role, reason="Owner recovery")
         await ctx.send("✅ Owner role restored.")
     except discord.Forbidden:
-        await ctx.send("❌ I lack permission — check my role position in that server.")
+        await ctx.send("❌ I lack permission — move my role above OWNER in Server Settings → Roles.")
 
 @bot.command()
 @require_setup()
@@ -383,7 +584,7 @@ async def trust(ctx, member_id: int):
     if member_id not in cfg["trusted"]:
         cfg["trusted"].append(member_id)
         save_configs()
-    await ctx.send(f"✅ `{member_id}` added to trusted list (exempt from anti-nuke).")
+    await ctx.send(f"✅ `{member_id}` added to trusted list.")
 
 @bot.command()
 @require_setup()
@@ -394,9 +595,8 @@ async def untrust(ctx, member_id: int):
         save_configs()
     await ctx.send(f"✅ `{member_id}` removed from trusted list.")
 
-
 # =================================================================
-# BACKUP / RESTORE (per-guild files)
+# BACKUP / RESTORE
 # =================================================================
 
 def serialize_overwrites(channel):
@@ -516,12 +716,11 @@ async def restore(ctx):
     guild = bot.get_guild(cfg["guild_id"])
     await do_restore(guild, ctx)
 
-
 # =================================================================
-# LOCKDOWN (per-guild, exact-state save/restore)
+# LOCKDOWN
 # =================================================================
 
-lockdown_active_map = {}  # guild_id -> bool
+lockdown_active_map = {}
 
 async def do_lockdown(guild):
     everyone = guild.default_role
@@ -599,12 +798,11 @@ async def unlock(ctx):
     count = await do_unlock(guild)
     await ctx.send(f"🔓 Lockdown lifted. {count} channels restored to their exact original state.")
 
-
 # =================================================================
 # KILL SWITCH
 # =================================================================
 
-pending_kills = {}  # user_id -> {"stage": int, "code": str}
+pending_kills = {}
 
 @bot.command()
 @require_setup()
@@ -612,7 +810,7 @@ async def kill(ctx):
     code = gen_code()
     pending_kills[ctx.author.id] = {"stage": 1, "code": code}
     await ctx.send(
-        f"⚠️ **EMERGENCY WIPE** ⚠️\nDeletes every channel and role in your server. Irreversible without !restore.\n"
+        f"⚠️ **EMERGENCY WIPE** ⚠️\nDeletes every channel and role. Irreversible without !restore.\n"
         f"Reply within {CONFIRM_TIMEOUT}s with exactly:\n`{code}`\n\nType !cancel to abort anytime."
     )
     async def expire(uid, stage, c):
@@ -652,7 +850,6 @@ async def execute_kill(guild, dm):
             failed_r += 1
     await dm.send(f"✅ Wipe complete. Channels: {deleted_c}/{deleted_c+failed_c}. Roles: {deleted_r}/{deleted_r+failed_r}.\nRun !restore to rebuild.")
 
-
 # =================================================================
 # STATUS / HELP
 # =================================================================
@@ -670,8 +867,10 @@ async def status(ctx):
             ts = json.load(f).get("_backed_up_at")
         if ts:
             backup_age = f"{int((time.time()-ts)//60)}m ago"
+    status_info = get_license_status(ctx.author.id)
     await ctx.send(
         f"**🩺 Status for {guild.name}**\n"
+        f"License expires: {status_info['expires_display'] if status_info else 'Unknown'}\n"
         f"Last backup: {backup_age}\n"
         f"Lockdown active: {'Yes 🔒' if lockdown_active_map.get(guild.id) else 'No'}\n"
         f"Top role: {guild.me.top_role.name}\n"
@@ -686,36 +885,58 @@ async def status(ctx):
 async def custom_help(ctx):
     if not isinstance(ctx.channel, discord.DMChannel):
         return
-    await ctx.send(
-        "**🛠 Server Guardian Bot — Commands**\n\n"
+    text = (
+        f"**🛠 {BRAND_NAME} — Commands**\n\n"
         "**Getting started**\n"
+        "`!activate <key>` — activate your license key\n"
+        "`!mylicense` — check your license status\n"
         "`!setup` — first-time setup wizard\n"
         "`!resetup` — reconfigure your server\n"
         "`!myconfig` — view your current settings\n\n"
         "**Recovery**\n"
-        "`!invite` / `!owner` / `!unban`\n\n"
+        "`!invite` — get your server's invite link\n"
+        "`!owner` — restore your OWNER role\n"
+        "`!unban` — manually unban yourself\n\n"
         "**Backup**\n"
-        "`!backup` / `!restore`\n\n"
-        "**Emergency**\n"
-        "`!kill` (2-step confirm) / `!cancel`\n\n"
-        "**Server control**\n"
-        "`!lockdown` / `!unlock`\n\n"
-        "**Trust management**\n"
+        "`!backup` — save current server structure\n"
+        "`!restore` — rebuild from last backup\n\n"
+        "**Emergency Wipe**\n"
+        "`!kill` — start emergency wipe (2-step code confirmation)\n"
+        "`!cancel` — abort a pending wipe\n\n"
+        "**Server Control**\n"
+        "`!lockdown` — freeze @everyone (saves exact per-channel state)\n"
+        "`!unlock` — restores each channel to its exact pre-lockdown state\n\n"
+        "**Trust Management**\n"
         "`!trust <user_id>` / `!untrust <user_id>`\n\n"
         "**Status**\n"
-        "`!status`\n\n"
-        "**Automatic protection**: anti-nuke (mass ban/kick/delete detection), auto-unban if banned, mass-join raid lockdown."
+        "`!status` — bot health, license, backup age, lockdown state, permissions\n\n"
+        "**Automatic Protection (no command needed)**\n"
+        "• Auto-unban if you get banned\n"
+        "• Anti-nuke: detects mass bans/kicks/channel/role deletions, neutralizes the actor, auto-restores victims\n"
+        "• Mass-join raid detection: auto-locks the server if too many accounts join too fast"
     )
-
+    if is_master(ctx.author.id):
+        text += (
+            "\n\n**🔑 Admin-only (you)**\n"
+            "`!genk [duration] [count]` — generate license keys (run with no args for the menu)\n"
+            "`!bl <user_id>` — blacklist a user from the bot entirely\n"
+            "`!unbl <user_id>` — remove a blacklist entry"
+        )
+    await ctx.send(text)
 
 # =================================================================
-# MESSAGE ROUTER (setup wizard + kill confirmation)
+# MESSAGE ROUTER
 # =================================================================
 
 @bot.event
 async def on_message(message):
+    if message.author.bot:
+        return
+    if is_blacklisted(message.author.id):
+        return
+
     await bot.process_commands(message)
-    if message.author.bot or not isinstance(message.channel, discord.DMChannel):
+    if not isinstance(message.channel, discord.DMChannel):
         return
 
     if await handle_setup_message(message):
@@ -747,17 +968,16 @@ async def on_message(message):
         await message.channel.send("💥 Executing wipe...")
         await execute_kill(guild, message.channel)
 
-
 # =================================================================
-# ANTI-NUKE EVENTS (guild-aware via reverse index)
+# ANTI-NUKE EVENTS
 # =================================================================
 
 recent_bans, recent_kicks, recent_ch_del, recent_role_del = {}, {}, {}, {}
 recent_ban_victims = {}
 neutralized_actors = set()
 pending_raid_welcomes = set()
-recent_joins_map = {}   # guild_id -> [timestamps]
-last_mass_join_map = {} # guild_id -> ts
+recent_joins_map = {}
+last_mass_join_map = {}
 
 def _prune(lst, window):
     now = time.time()
@@ -825,7 +1045,7 @@ async def handle_raid(guild, owner_id, cfg, actor, action_desc, victim_ids=None)
 async def on_member_join(member):
     guild = member.guild
     owner_id = get_owner_id_for_guild(guild.id)
-    if owner_id is None:
+    if owner_id is None or not is_protection_active(owner_id):
         return
     cfg = configs[str(owner_id)]
 
@@ -849,7 +1069,7 @@ async def on_member_join(member):
 @bot.event
 async def on_member_ban(guild, user):
     owner_id = get_owner_id_for_guild(guild.id)
-    if owner_id is None:
+    if owner_id is None or not is_protection_active(owner_id):
         return
     cfg = configs[str(owner_id)]
 
@@ -876,7 +1096,7 @@ async def on_member_ban(guild, user):
 async def on_member_remove(member):
     guild = member.guild
     owner_id = get_owner_id_for_guild(guild.id)
-    if owner_id is None:
+    if owner_id is None or not is_protection_active(owner_id):
         return
     cfg = configs[str(owner_id)]
 
@@ -902,7 +1122,7 @@ async def on_member_remove(member):
 async def on_guild_channel_delete(channel):
     guild = channel.guild
     owner_id = get_owner_id_for_guild(guild.id)
-    if owner_id is None:
+    if owner_id is None or not is_protection_active(owner_id):
         return
     cfg = configs[str(owner_id)]
     await asyncio.sleep(1)
@@ -920,7 +1140,7 @@ async def on_guild_channel_delete(channel):
 async def on_guild_role_delete(role):
     guild = role.guild
     owner_id = get_owner_id_for_guild(guild.id)
-    if owner_id is None:
+    if owner_id is None or not is_protection_active(owner_id):
         return
     cfg = configs[str(owner_id)]
     await asyncio.sleep(1)
@@ -934,9 +1154,55 @@ async def on_guild_role_delete(role):
         neutralized_actors.add(actor.id)
         await handle_raid(guild, owner_id, cfg, actor, "mass role deletion")
 
+# =================================================================
+# BACKGROUND: LICENSE EXPIRY REMINDERS
+# =================================================================
+
+@tasks.loop(hours=24)
+async def check_expirations():
+    now = time.time()
+    for user_id_str, entry in licenses.get("activations", {}).items():
+        expires_at = entry.get("expires_at")
+        if expires_at is None:
+            continue
+        remaining = expires_at - now
+
+        if 0 < remaining <= 3 * 86400 and not entry.get("warned_3d"):
+            try:
+                user = await bot.fetch_user(int(user_id_str))
+                embed = discord.Embed(
+                    title=f"⏳ {BRAND_NAME} License Expiring Soon",
+                    description=f"Your license expires <t:{int(expires_at)}:R>. Renew soon to avoid a protection gap.",
+                    color=discord.Color.orange()
+                )
+                await user.send(embed=embed)
+            except Exception:
+                pass
+            entry["warned_3d"] = True
+            save_licenses()
+
+        elif remaining <= 0 and not entry.get("warned_expired"):
+            try:
+                user = await bot.fetch_user(int(user_id_str))
+                embed = discord.Embed(
+                    title=f"🔒 {BRAND_NAME} License Expired",
+                    description="Your license has expired. Protection is now paused. Purchase a new key and run `!activate` to restore it.",
+                    color=discord.Color.red()
+                )
+                await user.send(embed=embed)
+            except Exception:
+                pass
+            entry["warned_expired"] = True
+            save_licenses()
+
+@check_expirations.before_loop
+async def before_check():
+    await bot.wait_until_ready()
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}. Serving {len(configs)} configured server(s).")
+    if not check_expirations.is_running():
+        check_expirations.start()
 
 bot.run(BOT_TOKEN)
