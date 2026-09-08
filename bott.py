@@ -45,6 +45,8 @@ PRICE_MAP = {
 LTC_ORDER_TIMEOUT = 1800  # 30 minutes
 LTC_POLL_INTERVAL = 30    # seconds
 LTC_MIN_CONFIRMATIONS = 1
+
+MAX_PLANS_PER_OWNER = 20
 # ============================================
 
 intents = discord.Intents.default()
@@ -63,6 +65,7 @@ switch_requests = {"requests": {}}
 guild_to_owner = {}
 lockdown_active_map = {}
 shop_settings = {"ltc_address": None}
+shop_plans = {}  # str(owner_id) -> {plan_key: {"label":..., "days":..., "price":..., "position":...}}
 pool = None
 
 
@@ -113,6 +116,7 @@ async def init_db():
         await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS shop_channel_id BIGINT;")
         await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS shop_message_id BIGINT;")
         await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS setup_complete BOOLEAN;")
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS ltc_address TEXT;")
 
         # --- license_keys ---
         await conn.execute("""
@@ -193,6 +197,7 @@ async def init_db():
             );
         """)
         await conn.execute("ALTER TABLE sales ADD COLUMN IF NOT EXISTS method TEXT DEFAULT 'manual';")
+        await conn.execute("ALTER TABLE sales ADD COLUMN IF NOT EXISTS reseller_id BIGINT;")
 
         # --- raid_events ---
         await conn.execute("""
@@ -207,11 +212,24 @@ async def init_db():
             );
         """)
 
-        # --- shop_settings ---
+        # --- shop_settings (global fallback LTC address) ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS shop_settings (
                 id INTEGER PRIMARY KEY DEFAULT 1,
                 ltc_address TEXT
+            );
+        """)
+
+        # --- shop_plans (per-owner customizable plans) ---
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS shop_plans (
+                owner_id BIGINT NOT NULL,
+                plan_key TEXT NOT NULL,
+                label TEXT,
+                days INTEGER,
+                price NUMERIC(10,2),
+                position INTEGER DEFAULT 0,
+                PRIMARY KEY (owner_id, plan_key)
             );
         """)
 
@@ -231,6 +249,9 @@ async def init_db():
                 tx_hash TEXT
             );
         """)
+        await conn.execute("ALTER TABLE ltc_orders ADD COLUMN IF NOT EXISTS owner_id BIGINT;")
+        await conn.execute("ALTER TABLE ltc_orders ADD COLUMN IF NOT EXISTS duration_days INTEGER;")
+        await conn.execute("ALTER TABLE ltc_orders ADD COLUMN IF NOT EXISTS plan_label TEXT;")
 
         # --- gift_orders ---
         await conn.execute("""
@@ -246,6 +267,9 @@ async def init_db():
                 deny_reason TEXT
             );
         """)
+        await conn.execute("ALTER TABLE gift_orders ADD COLUMN IF NOT EXISTS owner_id BIGINT;")
+        await conn.execute("ALTER TABLE gift_orders ADD COLUMN IF NOT EXISTS duration_days INTEGER;")
+        await conn.execute("ALTER TABLE gift_orders ADD COLUMN IF NOT EXISTS plan_label TEXT;")
 
 
 async def load_all_from_db():
@@ -262,6 +286,7 @@ async def load_all_from_db():
                 "shop_channel_id": row.get("shop_channel_id"),
                 "shop_message_id": row.get("shop_message_id"),
                 "setup_complete": row.get("setup_complete"),
+                "ltc_address": row.get("ltc_address"),
             }
 
         for r in await conn.fetch("SELECT * FROM license_keys"):
@@ -300,25 +325,36 @@ async def load_all_from_db():
         for r in await conn.fetch("SELECT guild_id FROM lockdowns"):
             lockdown_active_map[r["guild_id"]] = True
 
+        for r in await conn.fetch("SELECT * FROM shop_plans ORDER BY owner_id, position"):
+            row = dict(r)
+            shop_plans.setdefault(str(row["owner_id"]), {})[row["plan_key"]] = {
+                "label": row.get("label"),
+                "days": row.get("days"),
+                "price": float(row["price"]) if row.get("price") is not None else None,
+                "position": row.get("position") or 0,
+            }
+
         row = await conn.fetchrow("SELECT ltc_address FROM shop_settings WHERE id=1")
         if row:
             shop_settings["ltc_address"] = row["ltc_address"]
 
     rebuild_guild_index()
-    print(f"[DB] Loaded {len(configs)} configs, {len(licenses['keys'])} keys, {len(licenses['activations'])} activations.")
+    plan_count = sum(len(v) for v in shop_plans.values())
+    print(f"[DB] Loaded {len(configs)} configs, {len(licenses['keys'])} keys, {len(licenses['activations'])} activations, {plan_count} shop plans.")
 
 
 async def db_upsert_config(owner_id, cfg):
     async with pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO configs (owner_id, guild_id, owner_role_name, invite_link, trusted, log_channel_id, log_category_id, shop_channel_id, shop_message_id, setup_complete)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            INSERT INTO configs (owner_id, guild_id, owner_role_name, invite_link, trusted, log_channel_id, log_category_id, shop_channel_id, shop_message_id, setup_complete, ltc_address)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
             ON CONFLICT (owner_id) DO UPDATE SET
                 guild_id=$2, owner_role_name=$3, invite_link=$4, trusted=$5,
-                log_channel_id=$6, log_category_id=$7, shop_channel_id=$8, shop_message_id=$9, setup_complete=$10
+                log_channel_id=$6, log_category_id=$7, shop_channel_id=$8, shop_message_id=$9, setup_complete=$10, ltc_address=$11
         """, owner_id, cfg["guild_id"], cfg["owner_role_name"], cfg["invite_link"],
              cfg.get("trusted", []), cfg.get("log_channel_id"), cfg.get("log_category_id"),
-             cfg.get("shop_channel_id"), cfg.get("shop_message_id"), cfg.get("setup_complete", False))
+             cfg.get("shop_channel_id"), cfg.get("shop_message_id"), cfg.get("setup_complete", False),
+             cfg.get("ltc_address"))
 
 
 async def db_delete_config(owner_id):
@@ -382,6 +418,21 @@ async def db_deny_switch_request(req_id, reason, resolved_at):
     async with pool.acquire() as conn:
         await conn.execute("UPDATE switch_requests SET status='denied', deny_reason=$2, resolved_at=$3 WHERE id=$1",
                             int(req_id), reason, resolved_at)
+
+
+async def db_upsert_plan(owner_id, plan_key, label, days, price, position):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO shop_plans (owner_id, plan_key, label, days, price, position)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            ON CONFLICT (owner_id, plan_key) DO UPDATE SET
+                label=$3, days=$4, price=$5, position=$6
+        """, owner_id, plan_key, label, days, price, position)
+
+
+async def db_delete_plan(owner_id, plan_key):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM shop_plans WHERE owner_id=$1 AND plan_key=$2", owner_id, plan_key)
 
 # =================================================================
 # EMBED HELPERS
@@ -479,6 +530,21 @@ def parse_duration(token):
     return f"{num}{unit}", num * days_per_unit[unit]
 
 
+def humanize_duration(label, days):
+    """Turns a parsed duration key like '60d' into a friendly default label like '60 Days'."""
+    if days is None:
+        return "Lifetime"
+    m = re.match(r"^(\d+)([dwmy])$", label)
+    if not m:
+        return label
+    num, unit = m.group(1), m.group(2)
+    unit_names = {"d": "Day", "w": "Week", "m": "Month", "y": "Year"}
+    name = unit_names.get(unit, unit)
+    if num != "1":
+        name += "s"
+    return f"{num} {name}"
+
+
 def get_license_status(user_id):
     entry = licenses.get("activations", {}).get(str(user_id))
     if not entry:
@@ -501,7 +567,31 @@ def is_protection_active(owner_id):
     return is_activated(owner_id)
 
 
-async def deliver_key(user_id, duration_label, duration_days, price, method):
+# ---- per-owner shop plan helpers ----
+
+DEFAULT_PLANS = [
+    ("30d", "30 Days", 30, 7.99),
+    ("lifetime", "Lifetime", None, 19.99),
+]
+
+
+def get_owner_plans(owner_id):
+    plans = shop_plans.get(str(owner_id), {})
+    return sorted(
+        [{"key": k, **v} for k, v in plans.items()],
+        key=lambda p: p["position"]
+    )
+
+
+async def seed_default_plans(owner_id):
+    if shop_plans.get(str(owner_id)):
+        return
+    for i, (key, label, days, price) in enumerate(DEFAULT_PLANS):
+        shop_plans.setdefault(str(owner_id), {})[key] = {"label": label, "days": days, "price": price, "position": i}
+        await db_upsert_plan(owner_id, key, label, days, price, i)
+
+
+async def deliver_key(user_id, duration_label, duration_days, price, method, reseller_id=None):
     """Generates + binds a key, DMs it, and logs the sale. Used by both LTC and gift-card success paths."""
     key = gen_license_key()
     entry = {
@@ -515,8 +605,8 @@ async def deliver_key(user_id, duration_label, duration_days, price, method):
 
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO sales (user_id, duration_label, price, method, created_at) VALUES ($1,$2,$3,$4,$5)",
-            user_id, duration_label, price, method, time.time()
+            "INSERT INTO sales (user_id, duration_label, price, method, created_at, reseller_id) VALUES ($1,$2,$3,$4,$5,$6)",
+            user_id, duration_label, price, method, time.time(), reseller_id
         )
 
     duration_display = "Lifetime ♾️" if duration_days is None else f"{duration_label} ({duration_days} days)"
@@ -531,6 +621,25 @@ async def deliver_key(user_id, duration_label, duration_days, price, method):
         pass
 
     return key
+
+
+async def notify_reseller_sale(owner_id, buyer_id, plan_label, price, method):
+    """Lets a reseller (server owner running their own /shop) know when their panel makes a sale."""
+    if not owner_id:
+        return
+    cfg = get_config(owner_id)
+    if not cfg:
+        return
+    desc = f"Your `/shop` panel just sold a **{plan_label}** plan via **{method.upper()}** for **${price:.2f}**.\nBuyer: `{buyer_id}`"
+    guild = bot.get_guild(cfg.get("guild_id")) if cfg.get("guild_id") else None
+    if guild:
+        await log_embed(owner_id, guild, "💰 Sale Made From Your Shop", desc, discord.Color.green())
+    else:
+        try:
+            owner_user = await bot.fetch_user(owner_id)
+            await owner_user.send(embed=brand_embed("💰 Sale Made From Your Shop", desc, discord.Color.green()))
+        except Exception:
+            pass
 
 
 @bot.check
@@ -578,12 +687,6 @@ async def get_audit_actor(guild, action, target_id=None):
 # SHOP PANEL — BUTTONS, MODALS, LTC + GIFT CARD FLOW
 # =================================================================
 
-DURATION_INFO = {
-    "30d": {"label": "30 Days", "days": 30, "price": PRICE_MAP["30d"]},
-    "lifetime": {"label": "Lifetime", "days": None, "price": PRICE_MAP["lifetime"]},
-}
-
-
 async def get_ltc_usd_price():
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
@@ -594,17 +697,18 @@ async def get_ltc_usd_price():
         return resp.json()["litecoin"]["usd"]
 
 
-async def create_ltc_order(user_id, duration_key):
-    if not shop_settings.get("ltc_address"):
-        return None, "LTC payments aren't set up yet. Contact the seller."
+async def create_ltc_order(owner_id, buyer_id, plan):
+    cfg = get_config(owner_id) or {}
+    address = cfg.get("ltc_address") or shop_settings.get("ltc_address")
+    if not address:
+        return None, "LTC payments aren't set up for this shop yet. Contact the seller."
 
-    info = DURATION_INFO[duration_key]
     try:
         ltc_price = await get_ltc_usd_price()
     except Exception:
         return None, "Couldn't fetch the current LTC price. Try again in a minute."
 
-    base_amount = info["price"] / ltc_price
+    base_amount = plan["price"] / ltc_price
     # unique 6th-decimal offset so concurrent orders never collide on the same address
     offset = random.randint(1, 999) / 100_000_000
     ltc_amount = round(base_amount + offset, 8)
@@ -612,47 +716,49 @@ async def create_ltc_order(user_id, duration_key):
     now = time.time()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO ltc_orders (user_id, duration_label, usd_price, ltc_amount, address, status, created_at, expires_at)
-            VALUES ($1,$2,$3,$4,$5,'pending',$6,$7) RETURNING id
-        """, user_id, duration_key, info["price"], ltc_amount, shop_settings["ltc_address"], now, now + LTC_ORDER_TIMEOUT)
+            INSERT INTO ltc_orders (user_id, owner_id, duration_label, duration_days, plan_label, usd_price, ltc_amount, address, status, created_at, expires_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$10) RETURNING id
+        """, buyer_id, owner_id, plan["key"], plan["days"], plan["label"], plan["price"], ltc_amount, address, now, now + LTC_ORDER_TIMEOUT)
         order_id = row["id"]
 
     return order_id, ltc_amount
 
 
-async def create_gift_order(user_id, duration_key, code):
-    info = DURATION_INFO[duration_key]
+async def create_gift_order(owner_id, buyer_id, plan, code):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO gift_orders (user_id, duration_label, usd_price, code, status, created_at)
-            VALUES ($1,$2,$3,$4,'pending',$5) RETURNING id
-        """, user_id, duration_key, info["price"], code, time.time())
+            INSERT INTO gift_orders (user_id, owner_id, duration_label, duration_days, plan_label, usd_price, code, status, created_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8) RETURNING id
+        """, buyer_id, owner_id, plan["key"], plan["days"], plan["label"], plan["price"], code, time.time())
         return row["id"]
 
 
-class DurationSelectView(discord.ui.View):
-    """Shown after clicking Buy with LTC / Buy with Gift Card — picks 30d vs lifetime."""
-    def __init__(self, method):
-        super().__init__(timeout=120)
+class PlanSelect(discord.ui.Select):
+    def __init__(self, owner_id, method, plans):
+        self.owner_id = owner_id
         self.method = method
+        self.plans_by_key = {p["key"]: p for p in plans}
+        options = [
+            discord.SelectOption(
+                label=f"{p['label']} — ${p['price']:.2f}",
+                value=p["key"],
+                description=("Lifetime access" if p["days"] is None else f"{p['days']} days of access")
+            ) for p in plans
+        ]
+        super().__init__(placeholder="Choose a plan...", options=options, min_values=1, max_values=1)
 
-    @discord.ui.button(label="$7.99 — 30 Days", style=discord.ButtonStyle.primary)
-    async def thirty_days(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_pick(interaction, "30d")
+    async def callback(self, interaction: discord.Interaction):
+        plan = self.plans_by_key[self.values[0]]
 
-    @discord.ui.button(label="$19.99 — Lifetime", style=discord.ButtonStyle.success)
-    async def lifetime(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_pick(interaction, "lifetime")
-
-    async def handle_pick(self, interaction, duration_key):
         if self.method == "ltc":
             await interaction.response.defer(ephemeral=True, thinking=True)
-            order_id, result = await create_ltc_order(interaction.user.id, duration_key)
+            order_id, result = await create_ltc_order(self.owner_id, interaction.user.id, plan)
             if order_id is None:
                 return await interaction.followup.send(embed=brand_embed("❌ Unavailable", result, discord.Color.red()), ephemeral=True)
 
             ltc_amount = result
-            address = shop_settings["ltc_address"]
+            cfg = get_config(self.owner_id) or {}
+            address = cfg.get("ltc_address") or shop_settings.get("ltc_address")
             embed = brand_embed(
                 "🪙 Send Exactly This Amount of LTC",
                 f"Order `#{order_id}` — expires in {LTC_ORDER_TIMEOUT // 60} minutes.\n\n"
@@ -662,24 +768,32 @@ class DurationSelectView(discord.ui.View):
             )
             embed.add_field(name="Address", value=f"`{address}`", inline=False)
             embed.add_field(name="Amount", value=f"`{ltc_amount} LTC`", inline=False)
-            embed.add_field(name="Plan", value=DURATION_INFO[duration_key]["label"], inline=True)
+            embed.add_field(name="Plan", value=plan["label"], inline=True)
             embed.add_field(name="Status", value="⏳ Waiting for payment...", inline=True)
             embed.set_footer(text=f"{BRAND_NAME} auto-checks every 30s. You'll get a DM the moment it's confirmed.")
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         elif self.method == "gift":
-            await interaction.response.send_modal(GiftCodeModal(duration_key))
+            await interaction.response.send_modal(GiftCodeModal(self.owner_id, plan))
+
+
+class DurationSelectView(discord.ui.View):
+    """Shown after clicking Buy with LTC / Buy with Gift Card — lists the seller's configured plans."""
+    def __init__(self, owner_id, method, plans):
+        super().__init__(timeout=120)
+        self.add_item(PlanSelect(owner_id, method, plans))
 
 
 class GiftCodeModal(discord.ui.Modal, title="Rewarable Gift Card"):
-    def __init__(self, duration_key):
+    def __init__(self, owner_id, plan):
         super().__init__()
-        self.duration_key = duration_key
+        self.owner_id = owner_id
+        self.plan = plan
 
     code = discord.ui.TextInput(label="Gift Card Code", placeholder="Enter your Rewarable code", required=True, max_length=100)
 
     async def on_submit(self, interaction: discord.Interaction):
-        order_id = await create_gift_order(interaction.user.id, self.duration_key, str(self.code))
+        order_id = await create_gift_order(self.owner_id, interaction.user.id, self.plan, str(self.code))
 
         embed = brand_embed(
             "🎁 Gift Card Submitted",
@@ -690,11 +804,11 @@ class GiftCodeModal(discord.ui.Modal, title="Rewarable Gift Card"):
 
         try:
             master = await bot.fetch_user(MASTER_USER_ID)
-            info = DURATION_INFO[self.duration_key]
             alert = brand_embed("🔔 New Gift Card Order", color=discord.Color.orange())
             alert.add_field(name="Order ID", value=str(order_id), inline=True)
             alert.add_field(name="Buyer", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
-            alert.add_field(name="Plan", value=f"{info['label']} — ${info['price']}", inline=True)
+            alert.add_field(name="Seller (Reseller)", value=f"`{self.owner_id}`", inline=True)
+            alert.add_field(name="Plan", value=f"{self.plan['label']} — ${self.plan['price']:.2f}", inline=True)
             alert.add_field(name="Code Submitted", value=f"`{self.code}`", inline=False)
             alert.add_field(name="To approve", value=f"`!approvegift {order_id}`", inline=True)
             alert.add_field(name="To deny", value=f"`!denygift {order_id} <reason>`", inline=True)
@@ -710,16 +824,28 @@ class ShopPanelView(discord.ui.View):
 
     @discord.ui.button(label="Buy with LTC", emoji="🪙", style=discord.ButtonStyle.primary, custom_id="perc_buy_ltc")
     async def buy_ltc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        owner_id = get_owner_id_for_guild(interaction.guild_id)
+        if owner_id is None:
+            return await interaction.response.send_message(embed=brand_embed("❌ Unavailable", "This shop isn't linked to an active seller.", discord.Color.red()), ephemeral=True)
+        plans = get_owner_plans(owner_id)
+        if not plans:
+            return await interaction.response.send_message(embed=brand_embed("❌ No Plans Available", "The seller hasn't configured any plans yet.", discord.Color.red()), ephemeral=True)
         embed = brand_embed("🪙 Buy with Litecoin", "Choose a plan:", EMBED_COLOR)
-        await interaction.response.send_message(embed=embed, view=DurationSelectView("ltc"), ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=DurationSelectView(owner_id, "ltc", plans), ephemeral=True)
 
     @discord.ui.button(label="Buy with Gift Card", emoji="🎁", style=discord.ButtonStyle.secondary, custom_id="perc_buy_gift")
     async def buy_gift(self, interaction: discord.Interaction, button: discord.ui.Button):
+        owner_id = get_owner_id_for_guild(interaction.guild_id)
+        if owner_id is None:
+            return await interaction.response.send_message(embed=brand_embed("❌ Unavailable", "This shop isn't linked to an active seller.", discord.Color.red()), ephemeral=True)
+        plans = get_owner_plans(owner_id)
+        if not plans:
+            return await interaction.response.send_message(embed=brand_embed("❌ No Plans Available", "The seller hasn't configured any plans yet.", discord.Color.red()), ephemeral=True)
         embed = brand_embed("🎁 Buy with Rewarable Gift Card", "Choose a plan:", EMBED_COLOR)
-        await interaction.response.send_message(embed=embed, view=DurationSelectView("gift"), ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=DurationSelectView(owner_id, "gift", plans), ephemeral=True)
 
 
-async def create_shop_panel(guild, cfg):
+async def create_shop_panel(guild, cfg, owner_id):
     """Replaces any existing shop panel channel with a fresh one, same pattern as logs."""
     old_channel_id = cfg.get("shop_channel_id") if cfg else None
     channels_to_remove = []
@@ -743,10 +869,14 @@ async def create_shop_panel(guild, cfg):
             "perc-shop", reason=f"{BRAND_NAME}: shop panel",
             topic=f"🛒 Buy {BRAND_NAME} protection — LTC or Rewarable gift card."
         )
+        plans = get_owner_plans(owner_id)
+        if plans:
+            plan_lines = "\n".join(f"💵 **{p['label']}** — ${p['price']:.2f}" for p in plans)
+        else:
+            plan_lines = "⚠️ No plans configured yet — run `!addplan` in DMs with me to add some."
         embed = brand_embed(
             f"🛒 {BRAND_NAME} Shop",
-            f"Pick a payment method below to get protected.\n\n"
-            f"**Plans:**\n💵 30 Days — $7.99\n💵 Lifetime — $19.99",
+            f"Pick a payment method below to get protected.\n\n**Plans:**\n{plan_lines}",
             EMBED_COLOR
         )
         msg = await channel.send(embed=embed, view=ShopPanelView())
@@ -788,8 +918,8 @@ async def poll_ltc_orders():
                         "UPDATE ltc_orders SET status='paid', completed_at=$2, tx_hash=$3 WHERE id=$1",
                         order["id"], time.time(), tx.get("tx_hash", "unknown")
                     )
-                    info = DURATION_INFO[order["duration_label"]]
-                    await deliver_key(order["user_id"], order["duration_label"], info["days"], float(order["usd_price"]), "ltc")
+                    await deliver_key(order["user_id"], order["plan_label"], order["duration_days"], float(order["usd_price"]), "ltc", reseller_id=order["owner_id"])
+                    await notify_reseller_sale(order["owner_id"], order["user_id"], order["plan_label"], float(order["usd_price"]), "ltc")
                     break
 
 
@@ -813,10 +943,9 @@ async def giftorders(ctx):
         return await ctx.send(embed=brand_embed("🎁 Pending Gift Orders", "None right now.", EMBED_COLOR))
     embed = brand_embed("🎁 Pending Gift Orders", color=EMBED_COLOR)
     for r in rows:
-        info = DURATION_INFO[r["duration_label"]]
         embed.add_field(
             name=f"Order #{r['id']}",
-            value=f"Buyer: `{r['user_id']}`\nPlan: {info['label']} — ${info['price']}\nCode: `{r['code']}`",
+            value=f"Buyer: `{r['user_id']}`\nSeller: `{r['owner_id']}`\nPlan: {r['plan_label']} — ${r['usd_price']}\nCode: `{r['code']}`",
             inline=False
         )
     await ctx.send(embed=embed)
@@ -840,8 +969,8 @@ async def approvegift(ctx, order_id: int = None):
 
         await conn.execute("UPDATE gift_orders SET status='approved', resolved_at=$2 WHERE id=$1", order_id, time.time())
 
-    info = DURATION_INFO[row["duration_label"]]
-    await deliver_key(row["user_id"], row["duration_label"], info["days"], float(row["usd_price"]), "gift")
+    await deliver_key(row["user_id"], row["plan_label"], row["duration_days"], float(row["usd_price"]), "gift", reseller_id=row["owner_id"])
+    await notify_reseller_sale(row["owner_id"], row["user_id"], row["plan_label"], float(row["usd_price"]), "gift")
     await ctx.send(embed=brand_embed("✅ Approved & Delivered", f"Key sent to `{row['user_id']}`.", discord.Color.green()))
 
 
@@ -877,7 +1006,7 @@ async def denygift(ctx, order_id: int = None, *, reason: str = None):
 # SLASH COMMANDS
 # =================================================================
 
-@bot.tree.command(name="setltc", description="Set the LTC address customers will pay to.")
+@bot.tree.command(name="setltc", description="Set the FALLBACK LTC address used by sellers who haven't set their own.")
 @app_commands.describe(address="Your Litecoin payout address")
 async def setltc(interaction: discord.Interaction, address: str):
     if not is_master(interaction.user.id):
@@ -891,12 +1020,12 @@ async def setltc(interaction: discord.Interaction, address: str):
         """, address.strip())
 
     await interaction.response.send_message(
-        embed=brand_embed("✅ LTC Address Set", f"`{address.strip()}`", discord.Color.green()),
+        embed=brand_embed("✅ Fallback LTC Address Set", f"`{address.strip()}`\n\nSellers who haven't run `!setmyltc` will route payments here.", discord.Color.green()),
         ephemeral=True
     )
 
 
-@bot.tree.command(name="shop", description="Post or refresh the Perc shop panel in this server.")
+@bot.tree.command(name="shop", description="Post or refresh your Perc shop panel in this server.")
 async def shop_command(interaction: discord.Interaction):
     owner_id = get_owner_id_for_guild(interaction.guild_id)
     if owner_id is None or owner_id != interaction.user.id:
@@ -904,7 +1033,7 @@ async def shop_command(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
     cfg = get_config(owner_id)
-    channel, msg, err = await create_shop_panel(interaction.guild, cfg)
+    channel, msg, err = await create_shop_panel(interaction.guild, cfg, owner_id)
     if channel:
         cfg["shop_channel_id"] = channel.id
         cfg["shop_message_id"] = msg.id
@@ -1159,6 +1288,11 @@ async def stats(ctx):
             SELECT method, COUNT(*) AS count, COALESCE(SUM(price),0) AS total
             FROM sales GROUP BY method ORDER BY total DESC
         """)
+        top_resellers = await conn.fetch("""
+            SELECT reseller_id, COUNT(*) AS count, COALESCE(SUM(price),0) AS total
+            FROM sales WHERE reseller_id IS NOT NULL
+            GROUP BY reseller_id ORDER BY total DESC LIMIT 5
+        """)
         total_raids = await conn.fetchval("SELECT COUNT(*) FROM raid_events")
         neutralized_raids = await conn.fetchval("SELECT COUNT(*) FROM raid_events WHERE neutralized = true")
 
@@ -1178,6 +1312,10 @@ async def stats(ctx):
     if by_method:
         method_breakdown = "\n".join(f"**{r['method']}** — {r['count']} sale(s) — ${r['total']:.2f}" for r in by_method)
         embed.add_field(name="Sales by Method", value=method_breakdown, inline=False)
+
+    if top_resellers:
+        reseller_breakdown = "\n".join(f"`{r['reseller_id']}` — {r['count']} sale(s) — ${r['total']:.2f}" for r in top_resellers)
+        embed.add_field(name="🏆 Top Resellers", value=reseller_breakdown, inline=False)
 
     embed.add_field(name="🛡️ Raids Stopped", value=f"{neutralized_raids} neutralized / {total_raids} detected", inline=True)
     embed.add_field(name="🔑 Active Licenses", value=str(active_licenses), inline=True)
@@ -1277,6 +1415,14 @@ async def approveswitch(ctx, req_id: str = None):
         await db_upsert_config(new_id, cfg)
         migrated_config = True
 
+        if str(old_id) in shop_plans:
+            plans = shop_plans.pop(str(old_id))
+            shop_plans[str(new_id)] = plans
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM shop_plans WHERE owner_id=$1", old_id)
+            for pk, p in plans.items():
+                await db_upsert_plan(new_id, pk, p["label"], p["days"], p["price"], p["position"])
+
     rebuild_guild_index()
 
     now = time.time()
@@ -1287,7 +1433,7 @@ async def approveswitch(ctx, req_id: str = None):
 
     await ctx.send(embed=brand_embed(
         "✅ Switch Approved",
-        f"Key `{key}` and license now bound to `{new_id}`." + (" Server config migrated too." if migrated_config else ""),
+        f"Key `{key}` and license now bound to `{new_id}`." + (" Server config and shop migrated too." if migrated_config else ""),
         discord.Color.green()
     ))
 
@@ -1488,6 +1634,8 @@ async def myconfig(ctx):
     embed.add_field(name="Owner Role", value=cfg["owner_role_name"], inline=True)
     embed.add_field(name="Log Channel", value=log_ch.mention if log_ch else "Missing — run !fixlogs", inline=True)
     embed.add_field(name="Shop Channel", value=shop_ch.mention if shop_ch else "Not created — run `/shop`", inline=True)
+    embed.add_field(name="Your LTC Address", value=(f"`{cfg['ltc_address']}`" if cfg.get("ltc_address") else "Not set — using platform default (`!setmyltc` to set your own)"), inline=False)
+    embed.add_field(name="Plans Configured", value=str(len(get_owner_plans(ctx.author.id))), inline=True)
     embed.add_field(name="Invite Link", value=cfg["invite_link"], inline=False)
     await ctx.send(embed=embed)
 
@@ -1580,9 +1728,11 @@ async def handle_setup_message(message):
             "shop_channel_id": None,
             "shop_message_id": None,
             "setup_complete": True,
+            "ltc_address": existing_cfg.get("ltc_address"),
         }
         configs[str(user_id)] = new_cfg
         await db_upsert_config(user_id, new_cfg)
+        await seed_default_plans(user_id)
         rebuild_guild_index()
         del setup_sessions[user_id]
 
@@ -1597,7 +1747,14 @@ async def handle_setup_message(message):
         embed.add_field(name="Log Channel", value=log_status, inline=False)
         embed.add_field(
             name="Next Steps",
-            value="Keep my role at the **top** of Server Settings → Roles.\nRun `/shop` in your server to post the buy panel.\nRun `!backup` now.\nType `!help` to see everything I can do.",
+            value=(
+                "Keep my role at the **top** of Server Settings → Roles.\n"
+                "Default plans (30 Days $7.99, Lifetime $19.99) are ready — customize with `!addplan`/`!removeplan`, view with `!plans`.\n"
+                "Run `!setmyltc <address>` so LTC payments come straight to you.\n"
+                "Run `/shop` in your server to post the buy panel.\n"
+                "Run `!backup` now.\n"
+                "Type `!help` to see everything I can do."
+            ),
             inline=False
         )
         await message.channel.send(embed=embed)
@@ -1682,6 +1839,128 @@ async def fixlogs(ctx):
         await ctx.send(embed=brand_embed("✅ Log Channel Refreshed", f"Fresh channel created: {channel.mention}", discord.Color.green()))
     else:
         await ctx.send(embed=brand_embed("❌ Failed", f"{err}\nCheck Manage Channels permission.", discord.Color.red()))
+
+# =================================================================
+# SHOP PLAN MANAGEMENT (per-owner customization)
+# =================================================================
+
+@bot.command(name="addplan")
+@require_setup()
+async def addplan(ctx, duration: str = None, price: float = None, *, label: str = None):
+    if not duration or price is None:
+        embed = brand_embed(f"🛒 Add / Update a Plan", "Add a new plan to your `/shop` panel, or update an existing one (same duration = overwrite).", EMBED_COLOR)
+        embed.add_field(name="Usage", value="`!addplan <duration> <price> [custom label]`", inline=False)
+        embed.add_field(
+            name="Examples",
+            value=(
+                "`!addplan 60d 12.99` → auto-labeled \"60 Days\"\n"
+                "`!addplan 60d 12.99 Two Month Pass` → custom label\n"
+                "`!addplan lifetime 24.99 Forever Access`"
+            ),
+            inline=False
+        )
+        embed.add_field(name="Duration formats", value="`<number>d/w/m/y` (e.g. `7d`, `6m`, `1y`) or `lifetime`.", inline=False)
+        return await ctx.send(embed=embed)
+
+    dur_key, days = parse_duration(duration)
+    if dur_key is None:
+        return await ctx.send(embed=brand_embed("❌ Invalid Duration", "Try `30d`, `60d`, `6m`, `1y`, `lifetime`, etc.", discord.Color.red()))
+
+    if price <= 0:
+        return await ctx.send(embed=brand_embed("❌ Invalid Price", "Must be greater than 0.", discord.Color.red()))
+
+    owner_plans = shop_plans.setdefault(str(ctx.author.id), {})
+    existed = dur_key in owner_plans
+    if not existed and len(owner_plans) >= MAX_PLANS_PER_OWNER:
+        return await ctx.send(embed=brand_embed("❌ Too Many Plans", f"Max {MAX_PLANS_PER_OWNER} plans per shop. Remove one with `!removeplan` first.", discord.Color.red()))
+
+    display_label = label or humanize_duration(dur_key, days)
+    position = owner_plans[dur_key]["position"] if existed else len(owner_plans)
+    final_price = round(price, 2)
+
+    owner_plans[dur_key] = {"label": display_label, "days": days, "price": final_price, "position": position}
+    await db_upsert_plan(ctx.author.id, dur_key, display_label, days, final_price, position)
+
+    dur_display = "Lifetime ♾️" if days is None else f"{days} days"
+    await ctx.send(embed=brand_embed(
+        f"✅ Plan {'Updated' if existed else 'Added'}",
+        f"**{display_label}** (`{dur_key}`) — ${final_price:.2f} — {dur_display}\n\nRun `/shop` again in your server to refresh the live panel.",
+        discord.Color.green()
+    ))
+
+
+@bot.command(name="removeplan")
+@require_setup()
+async def removeplan(ctx, duration: str = None):
+    if not duration:
+        return await ctx.send(embed=brand_embed("Usage", "`!removeplan <duration>` — e.g. `!removeplan 60d`. Run `!plans` to see your keys.", discord.Color.orange()))
+
+    dur_key, _ = parse_duration(duration)
+    if dur_key is None:
+        return await ctx.send(embed=brand_embed("❌ Invalid Duration", "Run `!plans` to see your current plan keys.", discord.Color.red()))
+
+    owner_plans = shop_plans.get(str(ctx.author.id), {})
+    if dur_key not in owner_plans:
+        return await ctx.send(embed=brand_embed("❌ Not Found", f"No plan with key `{dur_key}`. Run `!plans` to see what you've got.", discord.Color.red()))
+
+    del owner_plans[dur_key]
+    await db_delete_plan(ctx.author.id, dur_key)
+    await ctx.send(embed=brand_embed("🗑️ Plan Removed", f"`{dur_key}` removed. Run `/shop` again to refresh your live panel.", discord.Color.green()))
+
+
+@bot.command(name="plans")
+@require_setup()
+async def plans_cmd(ctx):
+    owner_plans = get_owner_plans(ctx.author.id)
+    if not owner_plans:
+        return await ctx.send(embed=brand_embed(
+            "🛒 Your Plans",
+            "No plans configured yet. Run `!resetplans` for defaults, or `!addplan <duration> <price>` to add your own.",
+            discord.Color.orange()
+        ))
+    embed = brand_embed("🛒 Your Shop Plans", "These are what customers see on your `/shop` panel.", EMBED_COLOR)
+    for p in owner_plans:
+        dur_display = "Lifetime ♾️" if p["days"] is None else f"{p['days']} days"
+        embed.add_field(name=f"{p['label']}  (`{p['key']}`)", value=f"${p['price']:.2f} — {dur_display}", inline=False)
+    embed.set_footer(text="Use !addplan / !removeplan to customize. Run /shop again after changes to refresh the live panel.")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="resetplans")
+@require_setup()
+async def resetplans(ctx):
+    shop_plans[str(ctx.author.id)] = {}
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM shop_plans WHERE owner_id=$1", ctx.author.id)
+    await seed_default_plans(ctx.author.id)
+    await ctx.send(embed=brand_embed("✅ Plans Reset", "Restored to defaults: 30 Days ($7.99) and Lifetime ($19.99). Run `/shop` again to refresh your panel.", discord.Color.green()))
+
+
+@bot.command(name="setmyltc")
+@require_setup()
+async def setmyltc(ctx, address: str = None):
+    if not address:
+        return await ctx.send(embed=brand_embed(
+            "Usage", "`!setmyltc <your LTC address>`\n\nLTC payments made through your `/shop` panel will be sent directly here instead of the platform default.",
+            discord.Color.orange()
+        ))
+    cfg = get_config(ctx.author.id)
+    cfg["ltc_address"] = address.strip()
+    await db_upsert_config(ctx.author.id, cfg)
+    await ctx.send(embed=brand_embed("✅ Your LTC Address Set", f"`{address.strip()}`\n\nAll LTC payments from your shop now go here.", discord.Color.green()))
+
+
+@bot.command(name="mysales")
+@require_setup()
+async def mysales(ctx):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT COUNT(*) AS count, COALESCE(SUM(price),0) AS total FROM sales WHERE reseller_id=$1", ctx.author.id)
+    embed = brand_embed(
+        "💰 Your Shop Sales",
+        f"**{row['count']}** sale(s) totaling **${row['total']:.2f}** through your `/shop` panel.",
+        EMBED_COLOR
+    )
+    await ctx.send(embed=embed)
 
 # =================================================================
 # BACKUP / RESTORE  (Postgres-backed)
@@ -2020,8 +2299,16 @@ async def custom_help(ctx):
         "`!mylicense` — see how much time you've got left\n"
         "`!setup` / `!resetup` — hook me up to your server\n"
         "`!myconfig` — check what's currently configured\n"
-        "`!useridswitch <reason>` — moved accounts? bring your key with you\n"
-        "`/shop` — post or refresh the buy panel in your server"
+        "`!useridswitch <reason>` — moved accounts? bring your key with you"
+    ), inline=False)
+    embed.add_field(name="🛒 Customize Your Shop", value=(
+        "`/shop` — post or refresh your buy panel in your server\n"
+        "`!addplan <duration> <price> [label]` — add/update a plan (e.g. `!addplan 60d 12.99 Two Month Pass`)\n"
+        "`!removeplan <duration>` — remove a plan\n"
+        "`!plans` — view your current plans\n"
+        "`!resetplans` — restore the default 30-day/lifetime plans\n"
+        "`!setmyltc <address>` — send YOUR shop's LTC payments straight to your own wallet\n"
+        "`!mysales` — see how much your shop has sold"
     ), inline=False)
     embed.add_field(name="🚑 If Something Goes Wrong", value=(
         "`!invite` — grab your server's invite link\n"
@@ -2041,9 +2328,9 @@ async def custom_help(ctx):
     ), inline=False)
     if is_master(ctx.author.id):
         embed.add_field(name="🔑 Just for You", value=(
-            "`/setltc <address>` — set your LTC payout address\n"
+            "`/setltc <address>` — set the FALLBACK LTC address (used by sellers without their own)\n"
             "`!bought <user_id> <duration> [price]` — sell a key and send it in one step\n"
-            "`!stats` — revenue, sales breakdown, raids stopped, active licenses\n"
+            "`!stats` — revenue, sales breakdown, top resellers, raids stopped, active licenses\n"
             "`!genk <duration> <user_id> [count]` — generate without sending\n"
             "`!giftorders` — see pending gift card orders\n"
             "`!approvegift <id>` / `!denygift <id> <reason>`\n"
