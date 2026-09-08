@@ -88,6 +88,7 @@ bot = PercBot(command_prefix="!", intents=intents, help_command=None)
 
 async def init_db():
     async with pool.acquire() as conn:
+        # --- configs ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS configs (
                 owner_id BIGINT PRIMARY KEY,
@@ -102,6 +103,18 @@ async def init_db():
                 setup_complete BOOLEAN
             );
         """)
+        # Safe on existing tables — patches in any columns added after the table first existed.
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS guild_id BIGINT;")
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS owner_role_name TEXT;")
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS invite_link TEXT;")
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS trusted BIGINT[];")
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS log_channel_id BIGINT;")
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS log_category_id BIGINT;")
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS shop_channel_id BIGINT;")
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS shop_message_id BIGINT;")
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS setup_complete BOOLEAN;")
+
+        # --- license_keys ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS license_keys (
                 key TEXT PRIMARY KEY,
@@ -114,6 +127,8 @@ async def init_db():
                 used_at DOUBLE PRECISION
             );
         """)
+
+        # --- activations ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS activations (
                 user_id BIGINT PRIMARY KEY,
@@ -124,11 +139,17 @@ async def init_db():
                 warned_expired BOOLEAN DEFAULT FALSE
             );
         """)
+        await conn.execute("ALTER TABLE activations ADD COLUMN IF NOT EXISTS warned_3d BOOLEAN DEFAULT FALSE;")
+        await conn.execute("ALTER TABLE activations ADD COLUMN IF NOT EXISTS warned_expired BOOLEAN DEFAULT FALSE;")
+
+        # --- blacklist ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS blacklist (
                 user_id BIGINT PRIMARY KEY
             );
         """)
+
+        # --- switch_requests ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS switch_requests (
                 id SERIAL PRIMARY KEY,
@@ -142,6 +163,8 @@ async def init_db():
                 deny_reason TEXT
             );
         """)
+
+        # --- backups ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS backups (
                 guild_id BIGINT PRIMARY KEY,
@@ -149,12 +172,16 @@ async def init_db():
                 backed_up_at DOUBLE PRECISION
             );
         """)
+
+        # --- lockdowns ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS lockdowns (
                 guild_id BIGINT PRIMARY KEY,
                 state TEXT
             );
         """)
+
+        # --- sales ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sales (
                 id SERIAL PRIMARY KEY,
@@ -165,6 +192,9 @@ async def init_db():
                 created_at DOUBLE PRECISION
             );
         """)
+        await conn.execute("ALTER TABLE sales ADD COLUMN IF NOT EXISTS method TEXT DEFAULT 'manual';")
+
+        # --- raid_events ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS raid_events (
                 id SERIAL PRIMARY KEY,
@@ -176,12 +206,16 @@ async def init_db():
                 created_at DOUBLE PRECISION
             );
         """)
+
+        # --- shop_settings ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS shop_settings (
                 id INTEGER PRIMARY KEY DEFAULT 1,
                 ltc_address TEXT
             );
         """)
+
+        # --- ltc_orders ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS ltc_orders (
                 id SERIAL PRIMARY KEY,
@@ -197,6 +231,8 @@ async def init_db():
                 tx_hash TEXT
             );
         """)
+
+        # --- gift_orders ---
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS gift_orders (
                 id SERIAL PRIMARY KEY,
@@ -215,46 +251,50 @@ async def init_db():
 async def load_all_from_db():
     async with pool.acquire() as conn:
         for r in await conn.fetch("SELECT * FROM configs"):
-            configs[str(r["owner_id"])] = {
-                "guild_id": r["guild_id"],
-                "owner_role_name": r["owner_role_name"],
-                "invite_link": r["invite_link"],
-                "trusted": list(r["trusted"]) if r["trusted"] else [],
-                "log_channel_id": r["log_channel_id"],
-                "log_category_id": r["log_category_id"],
-                "shop_channel_id": r["shop_channel_id"],
-                "shop_message_id": r["shop_message_id"],
-                "setup_complete": r["setup_complete"],
+            row = dict(r)
+            configs[str(row["owner_id"])] = {
+                "guild_id": row.get("guild_id"),
+                "owner_role_name": row.get("owner_role_name"),
+                "invite_link": row.get("invite_link"),
+                "trusted": list(row["trusted"]) if row.get("trusted") else [],
+                "log_channel_id": row.get("log_channel_id"),
+                "log_category_id": row.get("log_category_id"),
+                "shop_channel_id": row.get("shop_channel_id"),
+                "shop_message_id": row.get("shop_message_id"),
+                "setup_complete": row.get("setup_complete"),
             }
 
         for r in await conn.fetch("SELECT * FROM license_keys"):
-            licenses["keys"][r["key"]] = {
-                "duration_label": r["duration_label"],
-                "duration_days": r["duration_days"],
-                "bound_user_id": r["bound_user_id"],
-                "used": r["used"],
-                "used_by": r["used_by"],
-                "created_at": r["created_at"],
-                "used_at": r["used_at"],
+            row = dict(r)
+            licenses["keys"][row["key"]] = {
+                "duration_label": row.get("duration_label"),
+                "duration_days": row.get("duration_days"),
+                "bound_user_id": row.get("bound_user_id"),
+                "used": row.get("used"),
+                "used_by": row.get("used_by"),
+                "created_at": row.get("created_at"),
+                "used_at": row.get("used_at"),
             }
 
         for r in await conn.fetch("SELECT * FROM activations"):
-            licenses["activations"][str(r["user_id"])] = {
-                "key": r["key"],
-                "expires_at": r["expires_at"],
-                "duration_label": r["duration_label"],
-                "warned_3d": r["warned_3d"],
-                "warned_expired": r["warned_expired"],
+            row = dict(r)
+            licenses["activations"][str(row["user_id"])] = {
+                "key": row.get("key"),
+                "expires_at": row.get("expires_at"),
+                "duration_label": row.get("duration_label"),
+                "warned_3d": row.get("warned_3d"),
+                "warned_expired": row.get("warned_expired"),
             }
 
         for r in await conn.fetch("SELECT user_id FROM blacklist"):
             blacklist.add(r["user_id"])
 
         for r in await conn.fetch("SELECT * FROM switch_requests"):
-            switch_requests["requests"][str(r["id"])] = {
-                "key": r["key"], "old_user_id": r["old_user_id"], "new_user_id": r["new_user_id"],
-                "reason": r["reason"], "status": r["status"], "created_at": r["created_at"],
-                "resolved_at": r["resolved_at"], "deny_reason": r["deny_reason"],
+            row = dict(r)
+            switch_requests["requests"][str(row["id"])] = {
+                "key": row.get("key"), "old_user_id": row.get("old_user_id"), "new_user_id": row.get("new_user_id"),
+                "reason": row.get("reason"), "status": row.get("status"), "created_at": row.get("created_at"),
+                "resolved_at": row.get("resolved_at"), "deny_reason": row.get("deny_reason"),
             }
 
         for r in await conn.fetch("SELECT guild_id FROM lockdowns"):
