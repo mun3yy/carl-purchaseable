@@ -1547,20 +1547,20 @@ async def custom_help(ctx):
         "`!myconfig` — check what's currently configured\n"
         "`!useridswitch <reason>` — moved accounts? bring your key with you"
     ), inline=False)
-    embed.add_field(name="🚑 If Something Goes Wrong", value=(
+    embed.add_field(name="🚑 if something bad happens", value=(
         "`!invite` — grab your server's invite link\n"
         "`!owner` — get your OWNER role back\n"
         "`!unban` — unban yourself if you got hit"
     ), inline=False)
-    embed.add_field(name="💾 Backups", value="`!backup` to save the server's current state, `!restore` to bring it back later.", inline=False)
-    embed.add_field(name="💥 The Nuclear Option", value="`!kill` wipes everything — it'll double-check with you twice before doing it. `!cancel` backs out at any point.", inline=False)
-    embed.add_field(name="🔐 Locking Things Down", value="`!lockdown` freezes the server, `!unlock` puts it back exactly how it was.", inline=False)
+    embed.add_field(name="💾 server backups", value="`!backup` to save the server's current state, `!restore` to bring it back later.", inline=False)
+    embed.add_field(name="💥 nuking stuff", value="`!kill` wipes everything — it'll double-check with you twice before doing it. `!cancel` backs out at any point.", inline=False)
+    embed.add_field(name="🔐 lockdowns", value="`!lockdown` freezes the server, `!unlock` puts it back exactly how it was.", inline=False)
     embed.add_field(name="📜 Logs", value="`!fixlogs` — rebuilds your log channel fresh if it ever breaks or disappears.", inline=False)
-    embed.add_field(name="📊 Health Check", value="`!status` — a quick look at what's working and what isn't.", inline=False)
+    embed.add_field(name="📊 status and health of bot", value="`!status` — a quick look at what's working and what isn't.", inline=False)
     embed.add_field(name="🛡️ What I Do Without Being Asked", value=(
-        "If you get banned, I unban you.\n"
-        "If someone starts mass-banning or mass-deleting, I stop them and reverse it.\n"
-        "If a bunch of accounts join at once, I lock things down before it turns into a mess.\n"
+        "if you get banned, i unban you.\n"
+        "if someone starts mass-banning or mass-deleting, i send the server invite to whoever got banned and restore the stuff that got deleted.\n"
+        "if a bunch of accounts join at once/ur getting raided, i lock down the server as quick as possible.\n"
         "Everything gets logged so you're never left wondering what happened."
     ), inline=False)
     if is_master(ctx.author.id):
