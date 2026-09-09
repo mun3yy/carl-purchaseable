@@ -48,6 +48,7 @@ LTC_POLL_INTERVAL = 30    # seconds
 LTC_MIN_CONFIRMATIONS = 1
 
 MAX_PLANS_PER_OWNER = 20
+DEFAULT_SHOP_CHANNEL_NAME = "perc-shop"
 # ============================================
 
 intents = discord.Intents.default()
@@ -124,6 +125,7 @@ async def init_db():
         await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS shop_message_id BIGINT;")
         await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS setup_complete BOOLEAN;")
         await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS ltc_address TEXT;")
+        await conn.execute("ALTER TABLE configs ADD COLUMN IF NOT EXISTS shop_channel_name TEXT;")
 
         # --- license_keys ---
         await conn.execute("""
@@ -294,6 +296,7 @@ async def load_all_from_db():
                 "shop_message_id": row.get("shop_message_id"),
                 "setup_complete": row.get("setup_complete"),
                 "ltc_address": row.get("ltc_address"),
+                "shop_channel_name": row.get("shop_channel_name"),
             }
 
         for r in await conn.fetch("SELECT * FROM license_keys"):
@@ -353,15 +356,15 @@ async def load_all_from_db():
 async def db_upsert_config(owner_id, cfg):
     async with pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO configs (owner_id, guild_id, owner_role_name, invite_link, trusted, log_channel_id, log_category_id, shop_channel_id, shop_message_id, setup_complete, ltc_address)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            INSERT INTO configs (owner_id, guild_id, owner_role_name, invite_link, trusted, log_channel_id, log_category_id, shop_channel_id, shop_message_id, setup_complete, ltc_address, shop_channel_name)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
             ON CONFLICT (owner_id) DO UPDATE SET
                 guild_id=$2, owner_role_name=$3, invite_link=$4, trusted=$5,
-                log_channel_id=$6, log_category_id=$7, shop_channel_id=$8, shop_message_id=$9, setup_complete=$10, ltc_address=$11
+                log_channel_id=$6, log_category_id=$7, shop_channel_id=$8, shop_message_id=$9, setup_complete=$10, ltc_address=$11, shop_channel_name=$12
         """, owner_id, cfg["guild_id"], cfg["owner_role_name"], cfg["invite_link"],
              cfg.get("trusted", []), cfg.get("log_channel_id"), cfg.get("log_category_id"),
              cfg.get("shop_channel_id"), cfg.get("shop_message_id"), cfg.get("setup_complete", False),
-             cfg.get("ltc_address"))
+             cfg.get("ltc_address"), cfg.get("shop_channel_name"))
 
 
 async def db_delete_config(owner_id):
@@ -635,6 +638,18 @@ def humanize_duration(label, days):
     return f"{num} {name}"
 
 
+def sanitize_channel_name(name):
+    """Discord channel names must be lowercase, no spaces, limited character set.
+    This coerces user input into something valid, or returns None if nothing usable remains."""
+    name = (name or "").lower().strip()
+    name = re.sub(r"\s+", "-", name)
+    name = re.sub(r"[^a-z0-9\-_]", "", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-_")
+    if not name:
+        return None
+    return name[:90]
+
+
 def get_license_status(user_id):
     entry = licenses.get("activations", {}).get(str(user_id))
     if not entry:
@@ -892,19 +907,65 @@ class GiftCodeModal(discord.ui.Modal, title="Rewarable Gift Card"):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+        # Self-purchase check: if the buyer IS the shop owner, this order can
+        # only ever be approved by master, never by the owner themself — so
+        # route the alert to master only. Sending it to the "seller" here
+        # would just be alerting the person trying to exploit their own shop.
+        is_self_purchase = (interaction.user.id == self.owner_id)
+
+        if is_self_purchase:
+            try:
+                master = await bot.fetch_user(MASTER_USER_ID)
+                alert = brand_embed("⚠️ Self-Purchase Gift Card Order — Requires Your Review", color=discord.Color.red())
+                alert.add_field(name="Order ID", value=str(order_id), inline=True)
+                alert.add_field(name="Seller/Buyer (same account)", value=f"`{interaction.user.id}`", inline=True)
+                alert.add_field(name="Plan", value=f"{self.plan['label']} — ${self.plan['price']:.2f}", inline=True)
+                alert.add_field(name="Code Submitted", value=f"`{self.code}`", inline=False)
+                alert.add_field(
+                    name="Why this needs you",
+                    value="This buyer is also the shop owner — they cannot approve their own order. Verify the code yourself before approving.",
+                    inline=False
+                )
+                alert.add_field(name="To approve", value=f"`!approvegift {order_id}`", inline=True)
+                alert.add_field(name="To deny", value=f"`!denygift {order_id} <reason>`", inline=True)
+                await master.send(embed=alert)
+            except Exception:
+                pass
+            return
+
+        alert = brand_embed("🔔 New Gift Card Order — Action Needed", color=discord.Color.orange())
+        alert.add_field(name="Order ID", value=str(order_id), inline=True)
+        alert.add_field(name="Buyer", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
+        alert.add_field(name="Plan", value=f"{self.plan['label']} — ${self.plan['price']:.2f}", inline=True)
+        alert.add_field(name="Code Submitted", value=f"`{self.code}`", inline=False)
+        alert.add_field(
+            name="What to do",
+            value=(
+                "Verify this code on Rewarable yourself, then run one of these in DMs with me:\n"
+                f"✅ To approve: `!approvegift {order_id}`\n"
+                f"❌ To deny: `!denygift {order_id} <reason>`"
+            ),
+            inline=False
+        )
+
         try:
-            master = await bot.fetch_user(MASTER_USER_ID)
-            alert = brand_embed("🔔 New Gift Card Order", color=discord.Color.orange())
-            alert.add_field(name="Order ID", value=str(order_id), inline=True)
-            alert.add_field(name="Buyer", value=f"{interaction.user} (`{interaction.user.id}`)", inline=True)
-            alert.add_field(name="Seller (Reseller)", value=f"`{self.owner_id}`", inline=True)
-            alert.add_field(name="Plan", value=f"{self.plan['label']} — ${self.plan['price']:.2f}", inline=True)
-            alert.add_field(name="Code Submitted", value=f"`{self.code}`", inline=False)
-            alert.add_field(name="To approve", value=f"`!approvegift {order_id}`", inline=True)
-            alert.add_field(name="To deny", value=f"`!denygift {order_id} <reason>`", inline=True)
-            await master.send(embed=alert)
+            seller = await bot.fetch_user(self.owner_id)
+            await seller.send(embed=alert)
         except Exception:
-            pass
+            # Seller's DMs are closed or unreachable — fall back to master so
+            # the order doesn't get silently stranded with no one aware it's
+            # waiting on verification.
+            try:
+                master = await bot.fetch_user(MASTER_USER_ID)
+                fallback = brand_embed("⚠️ Couldn't Reach Seller — Order Needs Attention", color=discord.Color.red())
+                fallback.add_field(name="Order ID", value=str(order_id), inline=True)
+                fallback.add_field(name="Seller (unreachable)", value=f"`{self.owner_id}`", inline=True)
+                fallback.add_field(name="Buyer", value=f"`{interaction.user.id}`", inline=True)
+                fallback.add_field(name="Plan", value=f"{self.plan['label']} — ${self.plan['price']:.2f}", inline=True)
+                fallback.add_field(name="Code Submitted", value=f"`{self.code}`", inline=False)
+                await master.send(embed=fallback)
+            except Exception:
+                pass
 
 
 class ShopPanelView(discord.ui.View):
@@ -936,7 +997,9 @@ class ShopPanelView(discord.ui.View):
 
 
 async def create_shop_panel(guild, cfg, owner_id):
-    """Replaces any existing shop panel channel with a fresh one, same pattern as logs."""
+    """Replaces any existing shop panel channel with a fresh one, same pattern as logs.
+    Channel name is customizable per-owner via !setshopname; defaults to 'perc-shop'."""
+    channel_name = cfg.get("shop_channel_name") or DEFAULT_SHOP_CHANNEL_NAME
     old_channel_id = cfg.get("shop_channel_id") if cfg else None
     channels_to_remove = []
 
@@ -945,7 +1008,7 @@ async def create_shop_panel(guild, cfg, owner_id):
         if ch:
             channels_to_remove.append(ch)
     for ch in guild.text_channels:
-        if ch.name == "perc-shop" and ch not in channels_to_remove:
+        if ch.name == channel_name and ch not in channels_to_remove:
             channels_to_remove.append(ch)
 
     for ch in channels_to_remove:
@@ -956,7 +1019,7 @@ async def create_shop_panel(guild, cfg, owner_id):
 
     try:
         channel = await guild.create_text_channel(
-            "perc-shop", reason=f"{BRAND_NAME}: shop panel",
+            channel_name, reason=f"{BRAND_NAME}: shop panel",
             topic=f"🛒 Buy {BRAND_NAME} protection — LTC or Rewarable gift card."
         )
         plans = get_owner_plans(owner_id)
@@ -1018,24 +1081,39 @@ async def before_poll():
     await bot.wait_until_ready()
 
 # =================================================================
-# GIFT CARD APPROVAL COMMANDS (admin only, manual verification)
+# GIFT CARD APPROVAL COMMANDS
 # =================================================================
+# Master can act on any order. A server owner can act only on orders placed
+# through their own shop — EXCEPT when the order is a self-purchase (the
+# buyer and the shop owner are the same account), which is master-only no
+# matter what, since that's the exact free-key exploit path this guards
+# against.
 
 @bot.command(name="giftorders")
 async def giftorders(ctx):
     if not isinstance(ctx.channel, discord.DMChannel):
         return
-    if not is_master(ctx.author.id):
-        return
+
+    master = is_master(ctx.author.id)
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM gift_orders WHERE status='pending' ORDER BY created_at ASC")
+        if master:
+            rows = await conn.fetch("SELECT * FROM gift_orders WHERE status='pending' ORDER BY created_at ASC")
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM gift_orders WHERE status='pending' AND owner_id=$1 ORDER BY created_at ASC",
+                ctx.author.id
+            )
+
     if not rows:
         return await ctx.send(embed=brand_embed("🎁 Pending Gift Orders", "None right now.", EMBED_COLOR))
+
     embed = brand_embed("🎁 Pending Gift Orders", color=EMBED_COLOR)
     for r in rows:
+        seller_line = f"\nSeller: `{r['owner_id']}`" if master else ""
+        self_flag = " ⚠️ SELF-PURCHASE (master review only)" if r["owner_id"] == r["user_id"] else ""
         embed.add_field(
-            name=f"Order #{r['id']}",
-            value=f"Buyer: `{r['user_id']}`\nSeller: `{r['owner_id']}`\nPlan: {r['plan_label']} — ${r['usd_price']}\nCode: `{r['code']}`",
+            name=f"Order #{r['id']}{self_flag}",
+            value=f"Buyer: `{r['user_id']}`{seller_line}\nPlan: {r['plan_label']} — ${r['usd_price']}\nCode: `{r['code']}`",
             inline=False
         )
     await ctx.send(embed=embed)
@@ -1045,8 +1123,6 @@ async def giftorders(ctx):
 async def approvegift(ctx, order_id: int = None):
     if not isinstance(ctx.channel, discord.DMChannel):
         return
-    if not is_master(ctx.author.id):
-        return
     if not order_id:
         return await ctx.send(embed=brand_embed("Usage", "`!approvegift <order_id>`", discord.Color.orange()))
 
@@ -1054,6 +1130,17 @@ async def approvegift(ctx, order_id: int = None):
         row = await conn.fetchrow("SELECT * FROM gift_orders WHERE id=$1", order_id)
         if not row:
             return await ctx.send(embed=brand_embed("❌ Not Found", color=discord.Color.red()))
+
+        is_self_purchase = row["owner_id"] == row["user_id"]
+        if is_self_purchase and not is_master(ctx.author.id):
+            return await ctx.send(embed=brand_embed(
+                "❌ Not Authorized",
+                "This order was placed by the shop owner buying from their own shop. It requires master review and can't be self-approved.",
+                discord.Color.red()
+            ))
+        if not is_self_purchase and not (is_master(ctx.author.id) or row["owner_id"] == ctx.author.id):
+            return await ctx.send(embed=brand_embed("❌ Not Authorized", "This order belongs to a different seller.", discord.Color.red()))
+
         if row["status"] != "pending":
             return await ctx.send(embed=brand_embed("Already Resolved", f"Status is `{row['status']}`.", discord.Color.orange()))
 
@@ -1068,8 +1155,6 @@ async def approvegift(ctx, order_id: int = None):
 async def denygift(ctx, order_id: int = None, *, reason: str = None):
     if not isinstance(ctx.channel, discord.DMChannel):
         return
-    if not is_master(ctx.author.id):
-        return
     if not order_id:
         return await ctx.send(embed=brand_embed("Usage", "`!denygift <order_id> <reason>`", discord.Color.orange()))
 
@@ -1077,6 +1162,17 @@ async def denygift(ctx, order_id: int = None, *, reason: str = None):
         row = await conn.fetchrow("SELECT * FROM gift_orders WHERE id=$1", order_id)
         if not row:
             return await ctx.send(embed=brand_embed("❌ Not Found", color=discord.Color.red()))
+
+        is_self_purchase = row["owner_id"] == row["user_id"]
+        if is_self_purchase and not is_master(ctx.author.id):
+            return await ctx.send(embed=brand_embed(
+                "❌ Not Authorized",
+                "This order was placed by the shop owner buying from their own shop. It requires master review.",
+                discord.Color.red()
+            ))
+        if not is_self_purchase and not (is_master(ctx.author.id) or row["owner_id"] == ctx.author.id):
+            return await ctx.send(embed=brand_embed("❌ Not Authorized", "This order belongs to a different seller.", discord.Color.red()))
+
         if row["status"] != "pending":
             return await ctx.send(embed=brand_embed("Already Resolved", f"Status is `{row['status']}`.", discord.Color.orange()))
 
@@ -1739,6 +1835,7 @@ async def myconfig(ctx):
     embed.add_field(name="Owner Role", value=cfg["owner_role_name"], inline=True)
     embed.add_field(name="Log Channel", value=log_ch.mention if log_ch else "Missing — run !fixlogs", inline=True)
     embed.add_field(name="Shop Channel", value=shop_ch.mention if shop_ch else "Not created — run `/shop`", inline=True)
+    embed.add_field(name="Shop Channel Name", value=f"`#{cfg.get('shop_channel_name') or DEFAULT_SHOP_CHANNEL_NAME}`" + ("" if cfg.get("shop_channel_name") else " (default)"), inline=True)
     embed.add_field(name="Your LTC Address", value=(f"`{cfg['ltc_address']}`" if cfg.get("ltc_address") else "Not set — using platform default (`!setmyltc` to set your own)"), inline=False)
     embed.add_field(name="Plans Configured", value=str(len(get_owner_plans(ctx.author.id))), inline=True)
     embed.add_field(name="Invite Link", value=cfg["invite_link"], inline=False)
@@ -1834,6 +1931,7 @@ async def handle_setup_message(message):
             "shop_message_id": None,
             "setup_complete": True,
             "ltc_address": existing_cfg.get("ltc_address"),
+            "shop_channel_name": existing_cfg.get("shop_channel_name"),
         }
         configs[str(user_id)] = new_cfg
         await db_upsert_config(user_id, new_cfg)
@@ -1856,6 +1954,7 @@ async def handle_setup_message(message):
                 "Keep my role at the **top** of Server Settings → Roles.\n"
                 "Default plans (30 Days $7.99, Lifetime $19.99) are ready — customize with `!addplan`/`!removeplan`, view with `!plans`.\n"
                 "Run `!setmyltc <address>` so LTC payments come straight to you.\n"
+                "Run `!setshopname <name>` if you want your shop channel called something other than `#perc-shop`.\n"
                 "Run `/shop` in your server to post the buy panel.\n"
                 "Run `!backup` now.\n"
                 "Type `!help` to see everything I can do."
@@ -2067,6 +2166,36 @@ async def setmyltc(ctx, address: str = None):
     cfg["ltc_address"] = address
     await db_upsert_config(ctx.author.id, cfg)
     await ctx.send(embed=brand_embed("✅ Your LTC Address Set", f"`{address}`\n\nAll LTC payments from your shop now go here.", discord.Color.green()))
+
+
+@bot.command(name="setshopname")
+@require_setup()
+async def setshopname(ctx, *, name: str = None):
+    if not name:
+        return await ctx.send(embed=brand_embed(
+            "Usage",
+            f"`!setshopname <name>`\n\nSets the channel name used for your `/shop` panel. Default is `#{DEFAULT_SHOP_CHANNEL_NAME}`.\n\n"
+            "Example: `!setshopname my-store` → creates `#my-store`\n\n"
+            "Run `/shop` again in your server afterward to apply the new name.",
+            discord.Color.orange()
+        ))
+
+    sanitized = sanitize_channel_name(name)
+    if not sanitized:
+        return await ctx.send(embed=brand_embed(
+            "❌ Invalid Name",
+            "That name doesn't leave any valid characters after cleanup. Use letters, numbers, hyphens, or underscores.",
+            discord.Color.red()
+        ))
+
+    cfg = get_config(ctx.author.id)
+    cfg["shop_channel_name"] = sanitized
+    await db_upsert_config(ctx.author.id, cfg)
+    await ctx.send(embed=brand_embed(
+        "✅ Shop Channel Name Set",
+        f"Your shop channel will be named `#{sanitized}`.\n\nRun `/shop` again in your server to apply it — this will replace your current shop channel.",
+        discord.Color.green()
+    ))
 
 
 @bot.command(name="mysales")
@@ -2427,7 +2556,10 @@ async def custom_help(ctx):
         "`!plans` — view your current plans\n"
         "`!resetplans` — restore the default 30-day/lifetime plans\n"
         "`!setmyltc <address>` — send YOUR shop's LTC payments straight to your own wallet\n"
-        "`!mysales` — see how much your shop has sold"
+        "`!setshopname <name>` — rename your shop channel (default is `#perc-shop`)\n"
+        "`!mysales` — see how much your shop has sold\n"
+        "`!giftorders` — see your pending gift card orders\n"
+        "`!approvegift <id>` / `!denygift <id> <reason>` — verify and resolve a gift card order"
     ), inline=False)
     embed.add_field(name="🚑 If Something Goes Wrong", value=(
         "`!invite` — grab your server's invite link\n"
@@ -2451,8 +2583,8 @@ async def custom_help(ctx):
             "`!bought <user_id> <duration> [price]` — sell a key and send it in one step\n"
             "`!stats` — revenue, sales breakdown, top resellers, raids stopped, active licenses\n"
             "`!genk <duration> <user_id> [count]` — generate without sending\n"
-            "`!giftorders` — see pending gift card orders\n"
-            "`!approvegift <id>` / `!denygift <id> <reason>`\n"
+            "`!giftorders` — see ALL pending gift card orders across every seller\n"
+            "`!approvegift <id>` / `!denygift <id> <reason>` — including self-purchase orders flagged for review\n"
             "`!bl <id>` / `!unbl <id>`\n"
             "`!switchrequests` / `!approveswitch <id>` / `!denyswitch <id> <reason>`"
         ), inline=False)
